@@ -43,28 +43,12 @@ The full rationale — every load-bearing decision, the alternatives that were r
 
 You need [Docker](https://docs.docker.com/get-docker/) and [Go 1.26+](https://go.dev/dl/).
 
-**1. Start Postgres** (the only thing this runs in Docker for local dev — the app itself runs directly on your machine):
-
 ```bash
-docker compose -f deploy/compose/docker-compose.yml up -d postgres
+make up    # start Postgres in Docker — the only thing containerized for local dev
+make run   # creates .env from .env.example on first run, then runs the API on your machine
 ```
 
-**2. Configure environment variables.** Copy the template and load it into your shell — `source` alone won't export the variables to the Go process, so wrap it with `set -a`:
-
-```bash
-cp .env.example .env
-set -a
-source .env
-set +a
-```
-
-**3. Run the API.** Database migrations run automatically on startup.
-
-```bash
-go run ./cmd/walletd api
-```
-
-**4. Try it:**
+Migrations run automatically on startup. Then try it:
 
 ```bash
 curl -X POST http://localhost:8080/v1/customers \
@@ -73,19 +57,19 @@ curl -X POST http://localhost:8080/v1/customers \
   -d '{}'
 ```
 
-You should get back a `201` with a customer ID and four provisioned accounts (ETH and USDC, on Base and Arbitrum).
+You should get back a `201` with a customer ID and four provisioned accounts (ETH and USDC, on Base and Arbitrum). Stop Postgres when you're done: `make down`.
 
-To stop Postgres when you're done: `docker compose -f deploy/compose/docker-compose.yml down`.
+Run `make help` for every available target. If you'd rather not use `make`, everything it wraps is a plain `go`/`docker compose` command — see the [Makefile](Makefile).
 
 ## Running the tests
 
 ```bash
-go build ./...
-go vet ./...
-go test ./...
+make test        # full suite, including the real-Postgres integration test
+make test-unit   # fast tests only, no Docker required
+make lint        # go vet + gofmt check
 ```
 
-Some tests spin up a real PostgreSQL container via [testcontainers-go](https://golang.testcontainers.org/) — no mocked repositories for correctness-critical paths. Docker must be running.
+The integration tests spin up a real PostgreSQL container via [testcontainers-go](https://golang.testcontainers.org/) — no mocked repositories for correctness-critical paths. Docker must be running for `make test`.
 
 ## Project structure
 

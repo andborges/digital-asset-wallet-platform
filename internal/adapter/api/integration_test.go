@@ -33,6 +33,9 @@ type testEnv struct {
 
 func newTestHandler(t *testing.T) testEnv {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping Docker-backed integration test in -short mode")
+	}
 	ctx := context.Background()
 
 	container, err := tcpostgres.Run(ctx, "postgres:18",
