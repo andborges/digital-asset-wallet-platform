@@ -1,0 +1,42 @@
+name: digital-asset-wallet-platform
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: walletd
+      POSTGRES_PASSWORD: walletd
+      POSTGRES_DB: walletd
+    ports:
+      - "5432:5432"
+    volumes:
+      # postgres:18+ images store data in a pg_ctlcluster-compatible, version-specific
+      # layout and require the volume mounted at the parent dir, not .../data directly
+      # (mounting at .../data makes the image refuse to start — verified locally 2026-07-14).
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U walletd -d walletd"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    command: ["api"]
+    environment:
+      DATABASE_URL: postgres://walletd:walletd@postgres:5432/walletd?sslmode=disable
+      API_LISTEN_ADDR: ":8080"
+      API_BEARER_TOKENS: ${API_BEARER_TOKENS:-dev-token}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# later epics add watcher/broadcaster/recon/dispatcher services here — do not add them
+# now, their subcommands don't exist until Epics 2-4.
+
+volumes:
+  postgres-data:

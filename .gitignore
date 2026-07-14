@@ -1,0 +1,25 @@
+# Secrets & local config — never commit real values (see .env.example for the template)
+.env
+.env.*
+!.env.example
+
+# Go build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go workspace files (local-only, per-developer)
+go.work
+go.work.sum
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local Docker Compose overrides
+docker-compose.override.yml
