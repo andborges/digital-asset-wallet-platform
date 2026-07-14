@@ -1,0 +1,378 @@
+<title>Wallet Platform — Architecture Walkthrough</title>
+<style>
+  :root {
+    --ground: #0F141A; --panel: #19212B; --panel-2: #1F2935; --line: #2A3644;
+    --ink: #E8EDF2; --muted: #8C99A6; --accent: #3FB68B; --accent-dim: #2A7D60;
+    --gold: #D9A441; --red: #E0655A;
+    --serif: Charter, "Bitstream Charter", Georgia, Cambria, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --ground: #F5F6F4; --panel: #FFFFFF; --panel-2: #EDF0EC; --line: #D5DCD4;
+      --ink: #1B2620; --muted: #5C6B62; --accent: #1E7A57; --accent-dim: #7FB59E;
+      --gold: #A87516; --red: #B5443A; }
+  }
+  :root[data-theme="dark"] { --ground: #0F141A; --panel: #19212B; --panel-2: #1F2935; --line: #2A3644;
+    --ink: #E8EDF2; --muted: #8C99A6; --accent: #3FB68B; --accent-dim: #2A7D60; --gold: #D9A441; --red: #E0655A; }
+  :root[data-theme="light"] { --ground: #F5F6F4; --panel: #FFFFFF; --panel-2: #EDF0EC; --line: #D5DCD4;
+    --ink: #1B2620; --muted: #5C6B62; --accent: #1E7A57; --accent-dim: #7FB59E; --gold: #A87516; --red: #B5443A; }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); overflow: hidden; }
+
+  .deck { height: 100vh; display: flex; }
+  .rail { width: 216px; flex: none; border-right: 1px solid var(--line); padding: 22px 0 22px 20px;
+    display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+  .rail .brand { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 18px; }
+  .rail button { all: unset; cursor: pointer; font-size: 12.5px; color: var(--muted); padding: 6px 10px 6px 12px;
+    border-left: 2px solid transparent; line-height: 1.35; }
+  .rail button:hover { color: var(--ink); }
+  .rail button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+  .rail button.on { color: var(--ink); border-left-color: var(--accent); }
+  .rail .n { font-family: var(--mono); font-size: 10px; color: var(--accent-dim); margin-right: 7px; }
+
+  .stage { flex: 1; position: relative; overflow: hidden; }
+  .slide { position: absolute; inset: 0; padding: 56px 72px 80px; overflow-y: auto;
+    opacity: 0; transform: translateY(14px); pointer-events: none;
+    transition: opacity .35s ease, transform .35s ease; }
+  .slide.on { opacity: 1; transform: none; pointer-events: auto; }
+  @media (prefers-reduced-motion: reduce) { .slide { transition: none; transform: none; } }
+
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 14px; }
+  h1 { font-family: var(--serif); font-size: clamp(34px, 5vw, 58px); font-weight: 500; line-height: 1.08;
+    margin: 0 0 18px; text-wrap: balance; max-width: 17ch; }
+  h2 { font-family: var(--serif); font-size: clamp(26px, 3.4vw, 38px); font-weight: 500; line-height: 1.12;
+    margin: 0 0 26px; text-wrap: balance; }
+  p.lede { font-size: 17px; line-height: 1.55; color: var(--muted); max-width: 58ch; margin: 0 0 10px; }
+  p.lede strong { color: var(--ink); font-weight: 600; }
+
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-top: 26px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 18px 18px 16px; }
+  .card h3 { margin: 0 0 8px; font-size: 14.5px; font-weight: 650; }
+  .card p { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--muted); }
+  .card .tag { font-family: var(--mono); font-size: 10.5px; color: var(--accent); letter-spacing: .08em; }
+  .mono { font-family: var(--mono); }
+  .k { color: var(--accent); } .g { color: var(--gold); } .r { color: var(--red); }
+
+  .diagram { margin-top: 28px; display: flex; flex-wrap: wrap; gap: 18px; align-items: stretch; }
+  .dbox { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 12px 16px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.5; }
+  .dbox .t { color: var(--accent); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; display: block; margin-bottom: 4px; }
+  .hub { border-color: var(--accent-dim); background: var(--panel-2); }
+  .arrow { align-self: center; color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+
+  table { border-collapse: collapse; margin-top: 24px; font-size: 13.5px; }
+  th { text-align: left; font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted); padding: 8px 26px 8px 0; border-bottom: 1px solid var(--line); font-weight: 500; }
+  td { padding: 9px 26px 9px 0; border-bottom: 1px solid var(--line); vertical-align: top; line-height: 1.45; }
+  td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; color: var(--ink); }
+  td { color: var(--muted); } td:first-child { color: var(--ink); }
+  .tablewrap { overflow-x: auto; }
+
+  .lifecycle { display: flex; gap: 0; margin: 34px 0 10px; align-items: center; flex-wrap: wrap; }
+  .stage-pill { border: 1px solid var(--line); border-radius: 999px; padding: 9px 20px; font-family: var(--mono);
+    font-size: 13px; color: var(--muted); background: var(--panel); transition: all .3s ease; }
+  .stage-pill.lit { border-color: var(--gold); color: var(--gold); }
+  .stage-pill.done { border-color: var(--accent); color: var(--accent); background: var(--panel-2); }
+  .lifecycle .link { width: 34px; height: 1px; background: var(--line); flex: none; }
+  .lifecycle-caption { font-size: 13px; color: var(--muted); font-family: var(--mono); min-height: 20px; margin-top: 14px; }
+
+  .posting { font-family: var(--mono); font-size: 13px; line-height: 1.9; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 16px 20px; margin-top: 22px; overflow-x: auto; }
+  .posting .cr { color: var(--accent); } .posting .dr { color: var(--gold); } .posting .cm { color: var(--muted); }
+
+  .adlist { margin-top: 26px; display: grid; gap: 10px; max-width: 860px; }
+  .ad { display: grid; grid-template-columns: 74px 1fr; gap: 14px; padding: 12px 14px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; font-size: 13.5px; line-height: 1.5; }
+  .ad .id { font-family: var(--mono); font-size: 12px; color: var(--accent); padding-top: 1px; }
+  .ad .why { color: var(--muted); }
+  .ad .why b { color: var(--ink); font-weight: 600; }
+
+  .footer-nav { position: absolute; bottom: 0; left: 216px; right: 0; display: flex; justify-content: space-between;
+    align-items: center; padding: 14px 72px; border-top: 1px solid var(--line); background: var(--ground); }
+  .footer-nav .hint { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .footer-nav .btns { display: flex; gap: 8px; }
+  .footer-nav button { all: unset; cursor: pointer; font-family: var(--mono); font-size: 12px; color: var(--ink);
+    border: 1px solid var(--line); border-radius: 4px; padding: 6px 14px; }
+  .footer-nav button:hover { border-color: var(--accent); color: var(--accent); }
+  .footer-nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .bigrule { display: flex; gap: 14px; align-items: baseline; margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--line); max-width: 760px; }
+  .bigrule .mark { font-family: var(--mono); color: var(--accent); font-size: 12px; flex: none; }
+  .bigrule p { margin: 0; font-family: var(--serif); font-size: 19px; line-height: 1.45; }
+
+  @media (max-width: 900px) {
+    .rail { display: none; }
+    .slide { padding: 34px 26px 90px; }
+    .footer-nav { left: 0; padding: 12px 26px; }
+  }
+</style>
+
+<div class="deck">
+  <nav class="rail" id="rail" aria-label="Slides">
+    <div class="brand">wallet·platform</div>
+  </nav>
+  <main class="stage" id="stage">
+
+    <section class="slide" data-title="Thesis">
+      <p class="eyebrow">Digital Asset Wallet Platform — Architecture Walkthrough</p>
+      <h1>The ledger side, done rigorously.</h1>
+      <p class="lede">Deposits, withdrawals, and balances for <strong>ETH &amp; USDC on Base and Arbitrum</strong> — the orchestration layer every custody build ends up hand-rolling: confirmation tiers, reorgs, nonces, idempotency, reconciliation.</p>
+      <p class="lede">No vendor covers it. The bet is that <strong>rigor is the product</strong>: tests that inject reorgs, a reviewed threat model, and a ledger that is always explainable against the chain.</p>
+      <div class="bigrule"><span class="mark">INVARIANT</span><p>A credited balance is never reversed by a chain event — and no money moves twice.</p></div>
+    </section>
+
+    <section class="slide" data-title="Four hard problems">
+      <p class="eyebrow">Why this is hard</p>
+      <h2>Four problems, each with a real-cost failure mode</h2>
+      <div class="cols">
+        <div class="card"><span class="tag">01 · TIERS</span><h3>Deposits are not binary</h3><p>An L2 transaction passes sequencer receipt → safe → finalized (~13–20 min). Credit early and a reorg becomes a <span class="r">double-credit</span>.</p></div>
+        <div class="card"><span class="tag">02 · RETRIES</span><h3>Withdrawals must never happen twice</h3><p>Crashes, retries, and duplicate calls are normal operation. Without idempotency and explicit state, they become <span class="r">duplicate payouts</span>.</p></div>
+        <div class="card"><span class="tag">03 · FEES</span><h3>Fees are chain-specific</h3><p>L2 execution fee + amortized L1 data fee, surfaced differently on Arbitrum and Base. Naive L1-style estimation <span class="r">systematically undercharges</span>.</p></div>
+        <div class="card"><span class="tag">04 · DRIFT</span><h3>The ledger drifts from the chain</h3><p>Missed deposits, stuck withdrawals, double-counts. Without independent reconciliation, <span class="r">customers find drift before operators do</span>.</p></div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="Shape">
+      <p class="eyebrow">Design paradigm</p>
+      <h2>Hexagonal core · one binary · five roles</h2>
+      <p class="lede">The domain core — ledger, state machines, policy — imports nothing. Adapters implement its ports. Chain isolation is <strong>structural, not conventional</strong>: nothing outside the EVM adapter may import go-ethereum or name a chain ID, enforced in CI <span class="mono k">(AD-1)</span>.</p>
+      <div class="diagram">
+        <div class="dbox"><span class="t">adapter</span>api · REST/OpenAPI</div>
+        <div class="dbox"><span class="t">adapter</span>postgres</div>
+        <div class="dbox hub"><span class="t">core</span>ledger · machines · policy · ports</div>
+        <div class="dbox"><span class="t">adapter</span>evm (base · arbitrum)</div>
+        <div class="dbox"><span class="t">adapter</span>signer (kms · software)</div>
+        <div class="dbox"><span class="t">adapter</span>webhook</div>
+      </div>
+      <p class="lede" style="margin-top:26px">One compiled binary, <span class="mono">walletd</span>, run as separate OS processes per role — <span class="mono">api · watcher · broadcaster · recon · dispatcher</span> — that share exactly one thing: <strong>Postgres</strong>. No RPC between processes, no broker, no shared memory <span class="mono k">(AD-2)</span>.</p>
+    </section>
+
+    <section class="slide" data-title="Topology">
+      <p class="eyebrow">System topology</p>
+      <h2>Everything meets in the database</h2>
+      <div class="diagram">
+        <div class="dbox"><span class="t">consumer</span>your application</div>
+        <div class="arrow">→ REST + webhooks →</div>
+        <div class="dbox"><span class="t">roles</span>api<br>watcher ×2<br>broadcaster ×2<br>recon<br>dispatcher</div>
+        <div class="arrow">⇄</div>
+        <div class="dbox hub"><span class="t">shared state</span>PostgreSQL 18</div>
+      </div>
+      <div class="diagram">
+        <div class="dbox"><span class="t">rpc provider A</span>watchers · broadcasters · fee reads</div>
+        <div class="dbox"><span class="t">rpc provider B</span>reconciliation — <span class="k">independent by rule (AD-12)</span></div>
+        <div class="dbox"><span class="t">kms</span>hot-wallet key — <span class="k">never leaves KMS (AD-10)</span><br><span style="color:var(--muted)">AWS in prod · LocalStack locally</span></div>
+      </div>
+      <p class="lede" style="margin-top:26px">If one RPC provider lies or lags, it cannot feed both the ledger <em>and</em> the check against it. “Reconciliation green” stays a fact, not an echo.</p>
+    </section>
+
+    <section class="slide" data-title="Money model">
+      <p class="eyebrow">The money model</p>
+      <h2>Double-entry, derived balances</h2>
+      <p class="lede">Every movement is a balanced journal entry across a fixed account taxonomy. Balances are derived — always recomputable from postings. One cause per entry, enforced by a unique constraint <span class="mono k">(AD-3)</span>.</p>
+      <div class="posting">
+<span class="cm">// deposit credited at finality — one atomic transaction (AD-4)</span><br>
+<span class="dr">DR</span>  platform:forwarder-float:base:usdc      250.000000<br>
+<span class="cr">CR</span>  customer:9f31…:available:usdc           250.000000<br>
+<span class="cm">cause = chain_event(base, 0x8c4a…, log 3)   + outbox: deposit.credited</span>
+      </div>
+      <div class="posting">
+<span class="cm">// sweep — treasury logistics, customers never touched (AD-9)</span><br>
+<span class="dr">DR</span>  platform:treasury:base:usdc             250.000000<br>
+<span class="cr">CR</span>  platform:forwarder-float:base:usdc      250.000000<br>
+<span class="cm">owner = broadcaster · one in-flight sweep per (chain, forwarder, asset)</span>
+      </div>
+    </section>
+
+    <section class="slide" data-title="Life of a deposit">
+      <p class="eyebrow">Life of a deposit</p>
+      <h2>Credited only at finality — by policy, forever</h2>
+      <div class="lifecycle" id="lifecycle">
+        <div class="stage-pill" data-cap="tx accepted by the L2 sequencer · reorderable">observed</div><div class="link"></div>
+        <div class="stage-pill" data-cap="batch posted to L1">safe</div><div class="link"></div>
+        <div class="stage-pill" data-cap="L1 finality · ~13–20 min">finalized</div><div class="link"></div>
+        <div class="stage-pill" data-cap="postings + outbox event, atomically · irreversible">credited</div>
+      </div>
+      <div class="lifecycle-caption" id="lifecap">watching…</div>
+      <p class="lede" style="margin-top:22px">Pre-finality records are visible as pending and safely reversed on reorgs. The watcher is the <strong>sole writer</strong> of deposit rows — including the credit itself <span class="mono k">(AD-6)</span>. Crediting policy is a per-(chain, asset) table; v1 pins every entry to <span class="mono">finalized</span> <span class="mono k">(AD-7)</span>.</p>
+      <p class="lede">Recovery after downtime is a cursor rescan; over-rescanning is harmless because chain events dedupe on <span class="mono">(chain, tx_hash, log_index)</span> <span class="mono k">(AD-5)</span>.</p>
+    </section>
+
+    <section class="slide" data-title="Deposit addresses">
+      <p class="eyebrow">Address generation</p>
+      <h2>One address per customer, every EVM chain, zero keys</h2>
+      <p class="lede">Deposit addresses are <strong>counterfactual CREATE2 forwarders</strong>: computed off-chain from (factory, salt, init code), deployed lazily at sweep time. The same factory sits at the same address on every chain via the canonical deterministic deployer — so the address holds on Base, Arbitrum, and any future EVM chain <span class="mono k">(AD-8)</span>.</p>
+      <div class="posting">
+address = CREATE2( factory <span class="cm">0x4e59…956C-deployed</span>,<br>
+                   salt    <span class="cm">customer UUID → bytes32, pinned + CI test vectors</span>,<br>
+                   keccak( forwarder init code ) )<br>
+<span class="cm">derived once · persisted · watchers attribute via table, never re-derive</span>
+      </div>
+      <div class="cols">
+        <div class="card"><h3>No per-customer key material</h3><p>The only signing keys in the system are the hot wallet's. No HD master seed, no sweep-key fleet.</p></div>
+        <div class="card"><h3>Immutable by design</h3><p>Factory address, init code, and salt scheme never change once live — changing any of them changes every customer address.</p></div>
+        <div class="card"><h3>Persistent contracts</h3><p>EIP-6780 ended destruct-and-redeploy; forwarders are persistent, modeled on BitGo's ForwarderV4 pattern.</p></div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="Withdrawals">
+      <p class="eyebrow">Withdrawals</p>
+      <h2>An explicit machine with one pair of hands</h2>
+      <div class="diagram" style="margin-top:20px">
+        <div class="dbox">created<br><span class="cm" style="color:var(--muted)">hold placed</span></div><div class="arrow">→</div>
+        <div class="dbox g">awaiting-approval<br><span style="color:var(--muted)">above threshold only</span></div><div class="arrow">→</div>
+        <div class="dbox">approved → signed → broadcast</div><div class="arrow">→</div>
+        <div class="dbox"><span class="k">confirmed</span> | <span class="r">failed</span><br><span style="color:var(--muted)">hold settled | released</span></div>
+      </div>
+      <p class="lede" style="margin-top:26px">Policy checks run before signing: balance covers amount + fee, destination well-formed, threshold routing applied (FR18). Every transition is a persisted, guarded step — crash mid-machine and the process resumes from the row <span class="mono k">(AD-6)</span>.</p>
+      <p class="lede">Exactly one <strong>broadcaster per chain</strong> — enforced by a Postgres advisory lock, not deployment discipline — signs and sends everything outbound, withdrawals and sweeps alike, allocating nonces from persisted state <span class="mono k">(AD-11)</span>. Consumers never see nonces, gas, or raw transactions.</p>
+    </section>
+
+    <section class="slide" data-title="Exactly-once">
+      <p class="eyebrow">Correctness machinery</p>
+      <h2>Exactly-once, enforced by the database</h2>
+      <div class="adlist">
+        <div class="ad"><span class="id">AD-4</span><span class="why"><b>One transaction per observable change.</b> Money changes carry postings + transition + outbox event atomically; state-only changes carry transition + event. Nothing observable happens outside such a commit.</span></div>
+        <div class="ad"><span class="id">AD-5</span><span class="why"><b>Idempotency by unique constraint, not by care.</b> API keys table with stored responses; chain events on (chain, tx_hash, log_index); one journal entry per cause. Retries hit constraints, never double-applies.</span></div>
+        <div class="ad"><span class="id">AD-13</span><span class="why"><b>Webhooks ride the outbox.</b> At-least-once, HMAC-signed, event ID = outbox row minted in the same transaction as the change it announces. Consumers dedupe on it.</span></div>
+        <div class="ad"><span class="id">AD-11</span><span class="why"><b>Single-writer broadcasting.</b> Nonce races removed structurally — one process per chain owns outbound, with an advisory lock making "one" true at runtime.</span></div>
+      </div>
+      <p class="lede" style="margin-top:24px">NFR1 and NFR2 aren't aspirations reviewed in code review — they fall out of schema constraints and transaction boundaries.</p>
+    </section>
+
+    <section class="slide" data-title="Failure modes">
+      <p class="eyebrow">Failure &amp; degraded modes</p>
+      <h2>Outages are a mode, not an incident</h2>
+      <div class="cols">
+        <div class="card"><span class="tag">REORGS</span><h3>History changes safely</h3><p>Pre-finality records reverse or re-credit; credited balances are untouchable by construction. Sequencer reordering and L1 batch reorgs are detected and absorbed (FR12–13).</p></div>
+        <div class="card"><span class="tag">SEQUENCER HALT</span><h3>Explicit chain status <span class="mono k">(AD-15)</span></h3><p>Liveness derived from watcher heartbeat and cursor staleness, exposed in the API. Deposits stay pending; withdrawals are accepted and <b>queue — never rejected for liveness</b>. Base halted twice in 2026; this is normal weather.</p></div>
+        <div class="card"><span class="tag">CRASH</span><h3>Resume from rows alone</h3><p>Every process restarts from persisted state: cursors rescan, machines resume, holds stand. No operator reconstruction, ever (NFR8).</p></div>
+        <div class="card"><span class="tag">DRIFT</span><h3>Independent reconciliation <span class="mono k">(AD-12)</span></h3><p>Streaming break-detection + batch deep pass on its own RPC provider. Read-only observer: it alarms, it never fixes. Seeded-fault tests prove the alarm actually fires.</p></div>
+      </div>
+    </section>
+
+    <section class="slide" data-title="Security">
+      <p class="eyebrow">Security posture</p>
+      <h2>The key never exists in software</h2>
+      <div class="adlist">
+        <div class="ad"><span class="id">AD-10</span><span class="why"><b>One signing boundary.</b> All signing goes through the core's Signer port. Production: AWS KMS secp256k1 — the key is generated in, and never leaves, the HSM-backed service. Dev/test: software signer behind the same port.</span></div>
+        <div class="ad"><span class="id">NFR16</span><span class="why"><b>The Bybit lesson.</b> $1.5B moved through a compromised third-party signing UI. Here, raw transactions are constructed and verified by the platform itself — no third-party UI in the path.</span></div>
+        <div class="ad"><span class="id">NFR12</span><span class="why"><b>The threat model ratifies, or the decision changes.</b> The written threat model is a deliverable with the same status as code — and AD-10 binds itself to it: a risk KMS can't mitigate revises the AD, not the workaround.</span></div>
+      </div>
+      <p class="lede" style="margin-top:24px">Honest edge, documented: funds sent to a customer address on an <em>unsupported</em> chain are recoverable only where the deterministic factory can be redeployed — stated plainly in consumer docs rather than discovered in an incident.</p>
+    </section>
+
+    <section class="slide" data-title="Stack">
+      <p class="eyebrow">Stack — every row verified current, 2026-07-14</p>
+      <h2>Boring on purpose</h2>
+      <div class="tablewrap">
+      <table>
+        <tr><th>Layer</th><th>Choice</th><th>Note</th></tr>
+        <tr><td>Language</td><td>Go 1.26</td><td>single module, one binary, role subcommands</td></tr>
+        <tr><td>Store</td><td>PostgreSQL 18 · pgx v5 · goose</td><td>the only shared state; constraints do the enforcement</td></tr>
+        <tr><td>Chain</td><td>go-ethereum v1.17 (ethclient)</td><td>behind the EVM adapter — nothing else imports it</td></tr>
+        <tr><td>API</td><td>OpenAPI spec-first · oapi-codegen v2</td><td>stdlib ServeMux; the spec is the self-serve documentation</td></tr>
+        <tr><td>Contracts</td><td>Solidity 0.8.36 · Foundry 1.7</td><td>factory + forwarder; anvil_reorg powers the fault-injection suite</td></tr>
+        <tr><td>Custody</td><td>AWS KMS secp256k1</td><td>signer lib vendored; LocalStack emulates KMS locally — same adapter, endpoint override</td></tr>
+        <tr><td>Deploy</td><td>Docker Compose v5 · local-first</td><td>v1 runs locally: LocalStack for AWS + real Sepolia testnets; EC2 is the graduation shape</td></tr>
+      </table>
+      </div>
+      <p class="lede" style="margin-top:24px">Sized honestly: thousands of movements per day with 10× burst headroom, reads &lt; 500 ms p95, ≤ 1 min platform overhead on the credit path — a <strong>tested contract</strong>, guarded in CI.</p>
+    </section>
+
+    <section class="slide" data-title="What's next">
+      <p class="eyebrow">Deliberately deferred · next steps</p>
+      <h2>The spine decides what diverges; the rest stays free</h2>
+      <div class="cols">
+        <div class="card"><h3>Deferred with owners</h3><p>Forwarder internals (contracts epic, audit trail required) · RPC vendor picks (ops) · operator approval surface (epic breakdown) · alert transport (ops) · in-stack Postgres vs RDS (revisit on backup-drill failure).</p></div>
+        <div class="card"><h3>Nothing forecloses the vision</h3><p>Multi-tenancy, policy engine, more chains and tokens, external custodian — the extension seams are the adapter boundary, the policy table, and the Signer port.</p></div>
+        <div class="card"><h3>From here</h3><p>Threat model + epics &amp; stories build directly on the 15 ADs. First real chain addition is the acceptance test the architecture signed up for.</p></div>
+      </div>
+      <div class="bigrule"><span class="mark">SUCCESS</span><p>Zero double-credits. Zero duplicate withdrawals. Drift found by the platform, not the customer — and a repo that proves it.</p></div>
+    </section>
+
+  </main>
+</div>
+
+<div class="footer-nav">
+  <span class="hint" id="counter">1 / 13</span>
+  <span class="hint">← → to navigate</span>
+  <div class="btns">
+    <button id="prev" type="button" aria-label="Previous slide">‹ prev</button>
+    <button id="next" type="button" aria-label="Next slide">next ›</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var rail = document.getElementById('rail');
+  var counter = document.getElementById('counter');
+  var idx = 0, timer = null;
+
+  slides.forEach(function (s, i) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.innerHTML = '<span class="n">' + String(i + 1).padStart(2, '0') + '</span>' + s.dataset.title;
+    b.addEventListener('click', function () { go(i); });
+    rail.appendChild(b);
+  });
+  var railBtns = Array.prototype.slice.call(rail.querySelectorAll('button'));
+
+  function animateLifecycle() {
+    var pills = Array.prototype.slice.call(document.querySelectorAll('#lifecycle .stage-pill'));
+    var cap = document.getElementById('lifecap');
+    if (!pills.length) return;
+    var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    pills.forEach(function (p) { p.classList.remove('lit', 'done'); });
+    var step = 0;
+    function tick() {
+      if (step > 0) { pills[step - 1].classList.remove('lit'); pills[step - 1].classList.add('done'); }
+      if (step < pills.length) {
+        pills[step].classList.add('lit');
+        cap.textContent = pills[step].textContent + ' — ' + pills[step].dataset.cap;
+        step++;
+        timer = setTimeout(tick, reduce ? 0 : 1400);
+      } else {
+        cap.textContent = 'credited — irreversible. reorgs can only ever touch what came before finality.';
+      }
+    }
+    if (reduce) {
+      pills.forEach(function (p) { p.classList.add('done'); });
+      cap.textContent = 'observed → safe → finalized → credited (irreversible)';
+    } else { tick(); }
+  }
+
+  function go(i) {
+    if (i < 0 || i >= slides.length) return;
+    if (timer) { clearTimeout(timer); timer = null; }
+    slides[idx].classList.remove('on');
+    railBtns[idx].classList.remove('on');
+    idx = i;
+    slides[idx].classList.add('on');
+    railBtns[idx].classList.add('on');
+    counter.textContent = (idx + 1) + ' / ' + slides.length;
+    location.hash = 's' + (idx + 1);
+    if (slides[idx].querySelector('#lifecycle')) animateLifecycle();
+  }
+
+  document.getElementById('prev').addEventListener('click', function () { go(idx - 1); });
+  document.getElementById('next').addEventListener('click', function () { go(idx + 1); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); go(idx + 1); }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); go(idx - 1); }
+    if (e.key === 'Home') { e.preventDefault(); go(0); }
+    if (e.key === 'End') { e.preventDefault(); go(slides.length - 1); }
+  });
+
+  var m = location.hash.match(/^#s(\d+)$/);
+  var start = m ? Math.min(Math.max(parseInt(m[1], 10) - 1, 0), slides.length - 1) : 0;
+  slides[start].classList.add('on'); railBtns[start].classList.add('on');
+  idx = start; counter.textContent = (idx + 1) + ' / ' + slides.length;
+  if (slides[start].querySelector('#lifecycle')) animateLifecycle();
+})();
+</script>
