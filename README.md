@@ -1,4 +1,4 @@
-# digital-asset-wallet-platform
+# Digital Assets Wallet Platform
 
 A backend platform that credits customers when crypto arrives and pays out on request — the **ledger side** of wallet infrastructure: deposit monitoring across L2 confirmation tiers, reorg handling, idempotent transaction state machines, and independent reconciliation. No vendor or mature open-source project covers this layer; it's the part every company in this position ends up building by hand.
 
