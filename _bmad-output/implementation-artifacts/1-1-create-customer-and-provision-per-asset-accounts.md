@@ -4,7 +4,7 @@ baseline_commit: 799e07f56d1ac26b28808aad1167c072a8677f86
 
 # Story 1.1: Create Customer & Provision Per-Asset Accounts
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -197,8 +197,33 @@ CREATE TABLE idempotency_keys (
   ```
   `goose.NewProvider` takes a `*sql.DB`, not a `*pgxpool.Pool` directly — open a small dedicated `*sql.DB` for migrations via `github.com/jackc/pgx/v5/stdlib` (`stdlib.OpenDBFromPool(pool)`), run migrations at `walletd api` startup before serving traffic, then continue using `pgxpool.Pool` for all application queries.
 
+## Senior Developer Review (AI)
+
+**Reviewed:** 2026-07-14 · **Reviewer model:** Opus 4.8 (adversarial layers) · **Outcome: Approved (after fixes applied)**
+
+Three parallel adversarial review layers ran against the diff (`799e07f..HEAD`, excluding generated `go.sum` and planning artifacts): Blind Hunter (general adversarial), Edge Case Hunter (branch/boundary exhaustive), and Acceptance Auditor (diff vs. the 5 ACs + AD-1…AD-15). All five ACs and every architecture constraint were confirmed satisfied. The layers converged strongly on a small set of real defects in the idempotency middleware — the single most-reused piece of code in the project — all of which were fixed and covered with new tests before marking this story done.
+
+### Action Items — resolved
+
+- [x] **[Critical] Handler panic leaked the open transaction + pooled connection.** `middleware_idempotency.go` had no rollback on the panic path; a few panics would exhaust the pool and wedge the service. **Fix:** a `defer` rolls the transaction back on every non-commit exit (including panic unwind), using a detached context so it runs even if the client cancelled. Covered by `TestIdempotencyMiddleware_HandlerPanicRollsBackTransaction`.
+- [x] **[High] Middleware committed and permanently cached non-2xx handler responses (idempotency-key poisoning).** A transient 500 was stored under the key and replayed forever, so a legitimate retry could never succeed — defeating the retry-safety FR23/FR24 exist for. **Fix:** commit + store are now gated on a 2xx status; any non-2xx rolls back and passes through unstored. Covered by `TestIdempotencyMiddleware_NonSuccessResponseIsNotStoredAndRollsBack`.
+- [x] **[High] Concurrent duplicate with a *different* body replayed the winner's response instead of 409.** The conflict branch skipped the request-hash comparison the non-concurrent path performs. **Fix:** both paths now funnel through one `replayOrConflict` helper, so a different-body duplicate 409s whether the collision is sequential or concurrent. Covered by `TestIdempotencyMiddleware_ConcurrentDuplicateDifferentBodyReturns409`.
+- [x] **[Medium] Unbounded `io.ReadAll` of the request body (memory-exhaustion vector).** **Fix:** `http.MaxBytesReader` caps the body at 1 MiB; oversized bodies get 413 before the handler runs. Covered by `TestIdempotencyMiddleware_OversizedBodyRejected`.
+- [x] **[Medium] No server timeouts / graceful shutdown.** Bare `http.ListenAndServe` (Slowloris exposure) and `context.Background()` with no signal handling (SIGTERM killed in-flight transactions). **Fix:** `http.Server` with Read/ReadHeader/Write/Idle timeouts, plus `signal.NotifyContext` + `srv.Shutdown` with a 20s drain. Verified by running the built binary and confirming a clean drain on SIGTERM (not unit-testable via the handler-only integration test).
+- [x] **[Medium] OpenAPI spec-vs-impl drift.** The spec declared the request body `additionalProperties: false` but nothing validated it. **Fix:** customer creation genuinely takes no body, so the `requestBody` was removed from `api/openapi.yaml` (with a description saying any body is ignored) and `server.gen.go` regenerated — spec now matches behavior (AD-14 spec-first honesty).
+- [x] **[Medium] Idempotency middleware forced a key + write transaction on non-mutating methods.** A future GET route would have been required to carry an Idempotency-Key. **Fix:** GET/HEAD/OPTIONS/TRACE now pass straight through. Covered by `TestIdempotencyMiddleware_NonMutatingMethodBypasses`.
+- [x] **[Low] Bearer token compared via non-constant-time map lookup.** **Fix:** `middleware_auth.go` now uses `crypto/subtle.ConstantTimeCompare` against every configured token (no early return, fail-closed on empty list).
+- [x] **[Low] Empty handler response committed a synthetic 200.** **Fix:** a handler that writes nothing is now treated as a programming error (500, no commit, not stored). Covered by `TestIdempotencyMiddleware_EmptyHandlerResponseIsError`.
+- [x] **[Low] Conflict re-lookup reused the possibly-cancelled request context.** **Fix:** the re-lookup and rollback/commit now use `context.WithoutCancel`, so they still complete if the client disconnected.
+
+### Action Items — deferred (documented, not blocking)
+
+- **[Low] Replay restores only `Content-Type`, not arbitrary response headers.** No handler sets other headers today (no `Location` on the 201); capturing all headers is a clean future enhancement to `StoredResponse` if/when a handler needs one. Not required by any AC.
+- **[Low] Idempotency keys are globally scoped, not per-consumer/per-route.** Correct and safe for the single v1 consumer; revisit when multi-tenancy arrives (already a future-path item in the architecture).
+
 ## Change Log
 
+- **Code review (2026-07-14):** applied 10 fixes from adversarial review (1 Critical, 2 High, 4 Medium, 3 Low) — panic-safe transaction rollback, 2xx-gated commit/store (no error caching), symmetric different-body 409, request-body size cap, server timeouts + graceful shutdown, OpenAPI body honesty + regeneration, non-mutating-method bypass, constant-time token comparison, empty-response guard, detached-context re-lookup. Added 6 new middleware tests; full suite green. Details in the Senior Developer Review section above.
 - Implemented all 5 ACs end-to-end: customer + 4 accounts creation, byte-for-byte idempotent replay, 409 on key-reuse-with-different-body, atomic transaction across customer+accounts+idempotency row, bearer-token authentication.
 - Bootstrapped the project: `go.mod` (module `github.com/andborges/digital-asset-wallet-platform`), hexagonal source tree (`internal/core`, `internal/adapter/{api,postgres}`, `cmd/walletd`), Docker Compose stack (`postgres:18` + `api`), minimal GitHub Actions CI.
 - **Post-review fix:** module path renamed from the placeholder `github.com/andre/...` to `github.com/andborges/digital-asset-wallet-platform` to match the repo's real `origin` remote — a public Go module whose import path doesn't match its actual location breaks `go get`/`go install` for anyone else. Renamed across `go.mod` and every internal import; `docker-compose.yml`'s `postgres:18` volume mount was also corrected (see below) after being caught by manually running the stack.

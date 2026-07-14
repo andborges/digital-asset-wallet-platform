@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -10,31 +11,50 @@ import (
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
 )
 
+// maxRequestBodyBytes caps the request body the idempotency layer will buffer and hash.
+// Every mutating request is read fully into memory before hashing, so an uncapped body is
+// a memory-exhaustion vector; 1 MiB is far larger than any legitimate v1 request.
+const maxRequestBodyBytes = 1 << 20
+
 // IdempotencyMiddleware requires an Idempotency-Key header on every mutating request
 // it wraps and guarantees exactly-once effects (AD-5, FR23–FR24):
 //
+//   - non-mutating method (GET/HEAD/OPTIONS/TRACE) -> passed straight through; no key, no transaction
 //   - missing key                              -> 400, handler never called
 //   - key already stored, same request body    -> stored response replayed verbatim, handler never called
 //   - key already stored, different request body -> 409, handler never called
-//   - key not stored                            -> a transaction opens, the handler runs against it via
-//     request context, its response is captured, the idempotency row is inserted in the SAME transaction,
-//     then the transaction commits and only THEN is the captured response flushed to the real client
-//   - a concurrent request wins the race to insert first -> this request's transaction rolls back and
-//     it returns the winner's stored response instead of a 500
+//   - key not stored -> a transaction opens, the handler runs against it via request context; ONLY a
+//     successful (2xx) response is persisted and committed — a non-2xx response rolls the transaction
+//     back and is returned WITHOUT being stored, so a transient error never poisons the key
+//   - a concurrent request wins the insert race -> this request's transaction rolls back and it returns
+//     the winner's stored response (or 409 if the winner used a different body)
+//
+// The transaction is rolled back on every exit path except a successful commit, including a panic in
+// the wrapped handler — so a handler panic can never leak the pooled connection.
 //
 // This is the one place AD-4's "one transaction per state change" promise is made real for every
 // later mutating story that reuses this middleware unchanged.
 func IdempotencyMiddleware(txBeginner core.TxBeginner, store core.IdempotencyStore) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !isMutatingMethod(r.Method) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			key := r.Header.Get("Idempotency-Key")
 			if key == "" {
 				WriteProblem(w, http.StatusBadRequest, "missing-idempotency-key", "Idempotency-Key header is required", r.URL.Path)
 				return
 			}
 
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 			bodyBytes, err := io.ReadAll(r.Body)
 			if err != nil {
+				if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+					WriteProblem(w, http.StatusRequestEntityTooLarge, "request-body-too-large", "request body exceeds the maximum allowed size", r.URL.Path)
+					return
+				}
 				WriteProblem(w, http.StatusBadRequest, "unreadable-body", "request body could not be read", r.URL.Path)
 				return
 			}
@@ -45,11 +65,7 @@ func IdempotencyMiddleware(txBeginner core.TxBeginner, store core.IdempotencySto
 				WriteProblem(w, http.StatusInternalServerError, "idempotency-lookup-failed", err.Error(), r.URL.Path)
 				return
 			} else if ok {
-				if !bytes.Equal(entry.RequestHash, hash) {
-					WriteProblem(w, http.StatusConflict, "idempotency-key-reused", "this Idempotency-Key was already used with a different request body", r.URL.Path)
-					return
-				}
-				replay(w, entry.Response)
+				replayOrConflict(w, r, entry, hash)
 				return
 			}
 
@@ -59,35 +75,83 @@ func IdempotencyMiddleware(txBeginner core.TxBeginner, store core.IdempotencySto
 				return
 			}
 
+			// Roll back on every path that isn't a successful commit — including a panic
+			// unwinding through this defer, which is what returns the pooled connection and
+			// prevents a handler panic from leaking it. A detached context is used so the
+			// rollback still runs even if the client disconnected and cancelled r.Context().
+			committed := false
+			defer func() {
+				if !committed {
+					_ = tx.Rollback(context.WithoutCancel(ctx))
+				}
+			}()
+
 			rec := newResponseRecorder()
 			next.ServeHTTP(rec, r.WithContext(ctx))
 			captured := rec.result()
 
+			// A handler that wrote nothing is a programming error; do not commit an
+			// empty transaction or cache a synthetic 200.
+			if !rec.wroteHeader {
+				WriteProblem(w, http.StatusInternalServerError, "empty-handler-response", "the handler produced no response", r.URL.Path)
+				return
+			}
+
+			// Only persist and commit successful outcomes. Non-2xx responses roll back
+			// (via the defer) and pass through unstored, so a retry gets a fresh attempt.
+			if captured.Status < 200 || captured.Status >= 300 {
+				replay(w, captured)
+				return
+			}
+
 			insertErr := store.Insert(ctx, key, hash, captured)
 			if errors.Is(insertErr, core.ErrKeyConflict) {
-				_ = tx.Rollback(ctx)
-				entry, ok, lookupErr := store.Lookup(r.Context(), key)
+				// A concurrent request committed the same key first. Return its stored
+				// result — or 409 if that winner used a different body. Use a detached
+				// context so the read still succeeds if the client has since disconnected.
+				entry, ok, lookupErr := store.Lookup(context.WithoutCancel(r.Context()), key)
 				if lookupErr != nil || !ok {
 					WriteProblem(w, http.StatusInternalServerError, "idempotency-conflict-unresolved", "a concurrent request won the race but its result could not be read back", r.URL.Path)
 					return
 				}
-				replay(w, entry.Response)
+				replayOrConflict(w, r, entry, hash)
 				return
 			}
 			if insertErr != nil {
-				_ = tx.Rollback(ctx)
 				WriteProblem(w, http.StatusInternalServerError, "idempotency-insert-failed", insertErr.Error(), r.URL.Path)
 				return
 			}
 
-			if err := tx.Commit(ctx); err != nil {
+			if err := tx.Commit(context.WithoutCancel(ctx)); err != nil {
 				WriteProblem(w, http.StatusInternalServerError, "transaction-commit-failed", err.Error(), r.URL.Path)
 				return
 			}
+			committed = true
 
 			replay(w, captured)
 		})
 	}
+}
+
+func isMutatingMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// replayOrConflict serves a stored idempotency entry: the original response if the
+// request body matches, or 409 if the same key was first used with a different body.
+// Used by both the pre-transaction lookup and the concurrent-conflict re-lookup so the
+// two paths cannot diverge.
+func replayOrConflict(w http.ResponseWriter, r *http.Request, entry core.StoredEntry, hash []byte) {
+	if !bytes.Equal(entry.RequestHash, hash) {
+		WriteProblem(w, http.StatusConflict, "idempotency-key-reused", "this Idempotency-Key was already used with a different request body", r.URL.Path)
+		return
+	}
+	replay(w, entry.Response)
 }
 
 func requestHash(method, path string, body []byte) []byte {

@@ -50,6 +50,10 @@ type fakeIdempotencyStore struct {
 	insertCalls  int
 	insertErr    error
 	conflictOnce bool // if true, the first Insert call returns ErrKeyConflict, then a stored entry appears
+	// conflictWinnerHash is the RequestHash the simulated concurrent winner stored.
+	// nil means "same body as the loser" (uses the incoming requestHash); set it to a
+	// different value to simulate a concurrent duplicate that used a different body.
+	conflictWinnerHash []byte
 }
 
 func (s *fakeIdempotencyStore) Lookup(ctx context.Context, key string) (core.StoredEntry, bool, error) {
@@ -64,7 +68,11 @@ func (s *fakeIdempotencyStore) Insert(ctx context.Context, key string, requestHa
 		if s.entries == nil {
 			s.entries = map[string]core.StoredEntry{}
 		}
-		s.entries[key] = core.StoredEntry{RequestHash: []byte("winner-hash"), Response: core.StoredResponse{Status: http.StatusCreated, Body: []byte(`{"id":"winner"}`)}}
+		winnerHash := s.conflictWinnerHash
+		if winnerHash == nil {
+			winnerHash = requestHash // same body as the loser
+		}
+		s.entries[key] = core.StoredEntry{RequestHash: winnerHash, Response: core.StoredResponse{Status: http.StatusCreated, Body: []byte(`{"id":"winner"}`)}}
 		return core.ErrKeyConflict
 	}
 	if s.insertErr != nil {
@@ -267,5 +275,160 @@ func TestIdempotencyMiddleware_HandlerReceivesContextWithOpenTransaction(t *test
 
 	if !sawTx {
 		t.Fatal("expected the handler to observe the open transaction via request context")
+	}
+}
+
+func TestIdempotencyMiddleware_NonSuccessResponseIsNotStoredAndRollsBack(t *testing.T) {
+	var calls int
+	txb := &fakeTxBeginner{}
+	store := &fakeIdempotencyStore{}
+	mw := IdempotencyMiddleware(txb, store)
+	handler := mw(countingHandler(&calls, http.StatusInternalServerError, `{"error":"boom"}`))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader(`{"foo":"bar"}`))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if calls != 1 {
+		t.Fatalf("handler was called %d times, want 1", calls)
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (the handler's error passed through)", rec.Code, http.StatusInternalServerError)
+	}
+	if store.insertCalls != 0 {
+		t.Fatalf("Insert was called %d times, want 0 — a non-2xx response must NOT be stored (no key poisoning)", store.insertCalls)
+	}
+	if !txb.lastTx.rolledBack {
+		t.Fatal("expected the transaction to be rolled back on a non-2xx response")
+	}
+	if txb.lastTx.committed {
+		t.Fatal("a non-2xx response must not commit the transaction")
+	}
+}
+
+func TestIdempotencyMiddleware_HandlerPanicRollsBackTransaction(t *testing.T) {
+	txb := &fakeTxBeginner{}
+	store := &fakeIdempotencyStore{}
+	mw := IdempotencyMiddleware(txb, store)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("handler blew up")
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader(`{"foo":"bar"}`))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+
+	func() {
+		defer func() {
+			// The panic is expected to propagate (net/http would recover it in production);
+			// what matters is that the deferred rollback ran during the unwind so the pooled
+			// connection is not leaked.
+			_ = recover()
+		}()
+		handler.ServeHTTP(rec, req)
+	}()
+
+	if txb.lastTx == nil {
+		t.Fatal("expected a transaction to have been opened")
+	}
+	if !txb.lastTx.rolledBack {
+		t.Fatal("expected the transaction to be rolled back when the handler panics (else the pooled connection leaks)")
+	}
+	if txb.lastTx.committed {
+		t.Fatal("a panicking handler must not commit the transaction")
+	}
+}
+
+func TestIdempotencyMiddleware_ConcurrentDuplicateDifferentBodyReturns409(t *testing.T) {
+	var calls int
+	txb := &fakeTxBeginner{}
+	// The concurrent winner stored a different request hash — simulating a same-key,
+	// different-body concurrent duplicate. This must 409, not replay the winner.
+	store := &fakeIdempotencyStore{conflictOnce: true, conflictWinnerHash: []byte("a-different-body-hash")}
+	mw := IdempotencyMiddleware(txb, store)
+	handler := mw(countingHandler(&calls, http.StatusCreated, `{"id":"loser"}`))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader(`{"foo":"bar"}`))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d — a concurrent duplicate with a different body must 409", rec.Code, http.StatusConflict)
+	}
+	if !txb.lastTx.rolledBack {
+		t.Fatal("expected the losing transaction to be rolled back")
+	}
+}
+
+func TestIdempotencyMiddleware_NonMutatingMethodBypasses(t *testing.T) {
+	var calls int
+	txb := &fakeTxBeginner{}
+	store := &fakeIdempotencyStore{}
+	mw := IdempotencyMiddleware(txb, store)
+	handler := mw(countingHandler(&calls, http.StatusOK, `ok`))
+
+	// A GET with no Idempotency-Key must pass straight through — no 400, no transaction.
+	req := httptest.NewRequest(http.MethodGet, "/v1/customers", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if calls != 1 {
+		t.Fatalf("handler was called %d times, want 1 (GET must pass through)", calls)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if txb.beginCount != 0 {
+		t.Fatalf("transaction was begun %d times, want 0 for a non-mutating method", txb.beginCount)
+	}
+}
+
+func TestIdempotencyMiddleware_EmptyHandlerResponseIsError(t *testing.T) {
+	txb := &fakeTxBeginner{}
+	store := &fakeIdempotencyStore{}
+	mw := IdempotencyMiddleware(txb, store)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// writes nothing at all
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader(`{}`))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d for a handler that produced no response", rec.Code, http.StatusInternalServerError)
+	}
+	if store.insertCalls != 0 {
+		t.Fatalf("Insert was called %d times, want 0 — an empty response must not be stored", store.insertCalls)
+	}
+	if txb.lastTx.committed {
+		t.Fatal("an empty response must not commit the transaction")
+	}
+}
+
+func TestIdempotencyMiddleware_OversizedBodyRejected(t *testing.T) {
+	var calls int
+	txb := &fakeTxBeginner{}
+	store := &fakeIdempotencyStore{}
+	mw := IdempotencyMiddleware(txb, store)
+	handler := mw(countingHandler(&calls, http.StatusCreated, `{"id":"1"}`))
+
+	huge := strings.Repeat("a", (1<<20)+1) // one byte over the 1 MiB cap
+	req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader(huge))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d for an oversized body", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	if calls != 0 {
+		t.Fatalf("handler was called %d times, want 0 — an oversized body is rejected before the handler", calls)
+	}
+	if txb.beginCount != 0 {
+		t.Fatalf("transaction was begun %d times, want 0", txb.beginCount)
 	}
 }

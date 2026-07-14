@@ -15,15 +15,11 @@ paths:
     post:
       operationId: createCustomer
       summary: Create a customer and provision its per-asset accounts
+      description: >
+        Takes no request body — a customer has no caller-supplied fields in v1. Any body
+        sent is ignored. The response is the created customer with its generated id.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
       responses:
         "201":
           description: Customer created

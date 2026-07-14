@@ -5,17 +5,32 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	adapterapi "github.com/andborges/digital-asset-wallet-platform/internal/adapter/api"
 	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/postgres"
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
+)
+
+// Server timeouts bound how long a single connection may tie up resources, closing off
+// slow-client (Slowloris) exposure. shutdownGracePeriod bounds how long in-flight
+// requests get to drain on SIGINT/SIGTERM before the process exits.
+const (
+	readHeaderTimeout   = 5 * time.Second
+	readTimeout         = 15 * time.Second
+	writeTimeout        = 30 * time.Second
+	idleTimeout         = 60 * time.Second
+	shutdownGracePeriod = 20 * time.Second
 )
 
 func main() {
@@ -39,7 +54,9 @@ func main() {
 }
 
 func runAPI(logger *slog.Logger) error {
-	ctx := context.Background()
+	// The root context is cancelled on SIGINT/SIGTERM, which triggers graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -77,12 +94,42 @@ func runAPI(logger *slog.Logger) error {
 			adapterapi.WriteProblem(w, http.StatusBadRequest, "invalid-request", err.Error(), r.URL.Path)
 		},
 	})
-
 	handler = adapterapi.IdempotencyMiddleware(txBeginner, idempotencyStore)(handler)
 	handler = adapterapi.AuthMiddleware(validTokens)(handler)
 
-	logger.Info("walletd api listening", "addr", listenAddr)
-	return http.ListenAndServe(listenAddr, handler)
+	srv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		logger.Info("walletd api listening", "addr", listenAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	select {
+	case err := <-serverErr:
+		return err
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, draining in-flight requests", "grace", shutdownGracePeriod.String())
+		stop() // stop intercepting signals; a second signal now terminates immediately
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("graceful shutdown failed: %w", err)
+		}
+		logger.Info("walletd api stopped cleanly")
+		return nil
+	}
 }
 
 func splitNonEmpty(s, sep string) []string {

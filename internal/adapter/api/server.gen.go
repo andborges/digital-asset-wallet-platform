@@ -47,16 +47,10 @@ type IdempotencyKey = string
 // bearerAuthContextKey is the context key for bearerAuth security scheme
 type bearerAuthContextKey string
 
-// CreateCustomerJSONBody defines parameters for CreateCustomer.
-type CreateCustomerJSONBody = map[string]interface{}
-
 // CreateCustomerParams defines parameters for CreateCustomer.
 type CreateCustomerParams struct {
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
 }
-
-// CreateCustomerJSONRequestBody defines body for CreateCustomer for application/json ContentType.
-type CreateCustomerJSONRequestBody = CreateCustomerJSONBody
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -255,19 +249,20 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"xFVNbyM3DP0rBNvDLjrxRzeLYufmTbZAUBQIWhQ9pDkwI9rWdkZSKY63RjD/vZA0diaO0XZPOY5Iie+R",
-	"73EesfFd8I6dRqwfMZBQx8qSv24Md8Eru2b/E+/TiXVY45bJsGCFjjrGepp2kfIqFP6rt8IGa5WeK4zN",
-	"ljtKD+g+pCtRxboNDsNwCOaCV31U37FkKOIDi1rOkUaYlM1K08faS0eKNRpSvlDbMVanL1dozbPcvrfm",
-	"ZdowBXuHOeWp1v0x3z985kbTs7fiH1rurlnJtvElUpMDZ7hWaF1Ucg2fDUYl7eMkZJ3yhiXF1Gp7/lY5",
-	"mNIU+58sc/Tw6rHyS7IJFTe9WN3/moZUCD4wCcuq1236ytNLl8rxU+2taigDtm7tS2diIzao9UlFN05Z",
-	"HLWwur2BtRfQLYOxG6vUAsXICl+obVkhtKSJ3ww+7Vj20PVKat0GxPfKMDKLUBAA9bplp7ahVAnIGSAH",
-	"JyKFImJ4s7q+WF6+ncEnES8R+sjwy49X8OHy/Q9AIbTjM/NQxv7d5+jd7A93bF+N1yPmVcb8e8F8O2JO",
-	"7LDCHUsstJezRZqbD+woWKzx3Wwxe4cVBtJt7u+8GV1QxOVj1nySWEZyY7DGqyzRo12qZ8a9e8RvhddY",
-	"4zfzJ3vPn1LmJ8Ye7os+OOpHb7LRG++UXa487UJif5x6NjQZY1OI2tuJDdbURn6ppyLEGLyLRUvfL5Zf",
-	"Ve0cr3F/zI/dyGWei+0Qg9HbaQSXi8W/1J7O+/9jOFkOZ5B8JANjr+ENzzYz6GyMSc3nFfq2QF2+AtSf",
-	"R2BewLodtdYcLKb+T3YF2IdXAHbaKeE+soEvVrdAYOx6zcJOj31+SKIeKnz/KhP/zfHfgRtlA5FlxwKc",
-	"dk1Zr33XkeyPjgaCg/vz4gridzZtDrAaIbBclM1ITeP79M8epks6W3+6nu/uk7VL1bIYemmxxvluicP9",
-	"8E8AAAD//w==",
+	"xFXNjiM1EH6VkuGwKzqdhJ0V2r6FmUUaIaQRLOIwzMHTrqS9222bcjlLNIrEQ/CEPAkqOz89SQR7m2O7",
+	"yq6vvqrv6yfV+iF4h46jap5U0KQHZKT8dWtwCJ7RtZsfcSMn1qlGdagNkqqU0wOqZpw2kbxKEf6RLKFR",
+	"DVPCSsW2w0HLA7wJciUyWbdS2+12H8wFr1NkPyBlKOQDElvMkZZQM5oFy8fS06BZNcpoxgnbAVV1+nKl",
+	"rHmWm5I152nbMdh7lVOOtR4O+f7xI7Ysz96Rf+xxuEHWto/nSE0OXOi1UtZF1q7Fi8HImlMchaxjXCFJ",
+	"jC33l2+Vg3GbZP+3yxzdv3qofN6soMI2keXNLzKk0uAjakJaJO7kK09PLpXjY+2OOZQBW7f0hZnYkg1s",
+	"vWzRrWMkp3tY3N3C0hNwh2DsyrLuQceIDJ913yND6DVLfzW8XyNtYEis2boVkE+MsOssQkEAOnGHjm2r",
+	"pRJoZ0A7OFlSKEsMrxY3k/nV6xreE3mKkCLCzz9cw7urt9+BDqHfPTMNZezffIze1b+7A32NutlhXmTM",
+	"vxXMdzvM0p2q1Boplrbn9Uzm5gM6Haxq1Jt6Vr9RlQqau8zvtN2poCyXj3xO3gf9CSM4n5vHyPDozQb+",
+	"+etv0LC/Dp3OKa0goklM0g0aWFrsTQTrYD2vYeE25XJEx2Aj2JXzhKaGD51wG4N3ESUg89lJ41jjs+UO",
+	"LEdYoUPKMWsKPyKKzN2tUY26zjcPAq+eWc39k/qacKka9dX0aEjTY8r0xIq2D7LRBVum6dvZPNuEd4wu",
+	"EzYengztsKzZhy6V2xnR9AAyb+9z4vexPRMyy6vZ7D9qjxfnyzGcuMwFJN9rc5j+K6xXNQw2RpHF5VV/",
+	"XaDOXwDqTztgnsC6te6t2WuV/Sd0Bdi7FwB2yhRhimjKUmswdrlEElmMVSZo377IxH91+GfAVjQWkdZI",
+	"gGJaxafTMGjaHIQ29gFxwEB+bcWCslgD0qRYrG5bn+Tnvx27fVbk2OfvH0RxpWrRa6JeNWq6nqvtw/bf",
+	"AAAA//8=",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
