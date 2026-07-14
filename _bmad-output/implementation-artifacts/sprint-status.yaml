@@ -1,0 +1,92 @@
+# generated: 2026-07-14
+# last_updated: 2026-07-14
+# project: digital-asset-wallet-platform
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+
+generated: 2026-07-14
+last_updated: 2026-07-14
+project: digital-asset-wallet-platform
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  epic-1: backlog
+  1-1-create-customer-and-provision-per-asset-accounts: backlog
+  1-2-query-customer-balances: backlog
+  1-3-ledger-only-internal-transfer-between-customers: backlog
+  1-4-list-customer-transaction-history: backlog
+  1-5-generate-per-customer-deposit-address-via-create2-forwarder: backlog
+  epic-1-retrospective: optional
+
+  epic-2: backlog
+  2-1-track-incoming-deposits-and-expose-pending-status: backlog
+  2-2-credit-deposits-at-finalized-tier-via-policy-table: backlog
+  2-3-handle-unsupported-token-transfers-without-ledger-corruption: backlog
+  2-4-detect-and-safely-reverse-reorged-pre-finality-deposits: backlog
+  2-5-recover-from-watcher-downtime-without-loss-or-double-processing: backlog
+  epic-2-retrospective: optional
+
+  epic-3: backlog
+  3-1-query-fee-estimate-before-submitting-a-withdrawal: backlog
+  3-2-request-a-withdrawal-with-idempotent-hold-placement: backlog
+  3-3-enforce-pre-signing-policy-and-threshold-based-approval-routing: backlog
+  3-4-sign-and-broadcast-withdrawals-via-the-single-writer-broadcaster: backlog
+  3-5-resolve-stuck-and-failed-withdrawals: backlog
+  3-6-sweep-forwarder-balances-to-treasury: backlog
+  epic-3-retrospective: optional
+
+  epic-4: backlog
+  4-1-register-webhook-endpoint-and-receive-deposit-withdrawal-events: backlog
+  4-2-verify-webhook-authenticity-via-signed-payloads: backlog
+  epic-4-retrospective: optional
+
+  epic-5: backlog
+  5-1-continuous-ledger-vs-chain-reconciliation-with-drift-alerts: backlog
+  5-2-query-reconciliation-status-and-run-history: backlog
+  5-3-operational-monitoring-and-alerting: backlog
+  epic-5-retrospective: optional
+
+  epic-6: backlog
+  6-1-written-threat-model: backlog
+  6-2-key-ceremony-backup-and-disaster-recovery-runbook: backlog
+  6-3-consolidated-fault-injection-test-suite: backlog
+  6-4-load-and-latency-validation-against-the-performance-envelope: backlog
+  epic-6-retrospective: optional
