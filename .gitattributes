@@ -1,4 +1,12 @@
-# Documentation
-_bmad/** linguist-documentation
+# Project documentation
+*.md linguist-documentation
 _bmad-output/** linguist-documentation
 docs/** linguist-documentation
+
+# BMAD / Claude tooling — not application source code
+_bmad/** linguist-vendored
+.claude/** linguist-vendored
+
+# Generated application code
+*.gen.go linguist-generated
+*.generated.go linguist-generated
