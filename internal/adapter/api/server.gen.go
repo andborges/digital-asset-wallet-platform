@@ -28,12 +28,84 @@ const (
 
 // Defines values for BalanceAsset.
 const (
-	Eth  BalanceAsset = "eth"
-	Usdc BalanceAsset = "usdc"
+	BalanceAssetEth  BalanceAsset = "eth"
+	BalanceAssetUsdc BalanceAsset = "usdc"
 )
 
 // Valid indicates whether the value is a known member of the BalanceAsset enum.
 func (e BalanceAsset) Valid() bool {
+	switch e {
+	case BalanceAssetEth:
+		return true
+	case BalanceAssetUsdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for BalanceChain.
+const (
+	BalanceChainArbitrum BalanceChain = "arbitrum"
+	BalanceChainBase     BalanceChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the BalanceChain enum.
+func (e BalanceChain) Valid() bool {
+	switch e {
+	case BalanceChainArbitrum:
+		return true
+	case BalanceChainBase:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TransferAsset.
+const (
+	TransferAssetEth  TransferAsset = "eth"
+	TransferAssetUsdc TransferAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the TransferAsset enum.
+func (e TransferAsset) Valid() bool {
+	switch e {
+	case TransferAssetEth:
+		return true
+	case TransferAssetUsdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TransferChain.
+const (
+	TransferChainArbitrum TransferChain = "arbitrum"
+	TransferChainBase     TransferChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the TransferChain enum.
+func (e TransferChain) Valid() bool {
+	switch e {
+	case TransferChainArbitrum:
+		return true
+	case TransferChainBase:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TransferRequestAsset.
+const (
+	Eth  TransferRequestAsset = "eth"
+	Usdc TransferRequestAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the TransferRequestAsset enum.
+func (e TransferRequestAsset) Valid() bool {
 	switch e {
 	case Eth:
 		return true
@@ -44,14 +116,14 @@ func (e BalanceAsset) Valid() bool {
 	}
 }
 
-// Defines values for BalanceChain.
+// Defines values for TransferRequestChain.
 const (
-	Arbitrum BalanceChain = "arbitrum"
-	Base     BalanceChain = "base"
+	Arbitrum TransferRequestChain = "arbitrum"
+	Base     TransferRequestChain = "base"
 )
 
-// Valid indicates whether the value is a known member of the BalanceChain enum.
-func (e BalanceChain) Valid() bool {
+// Valid indicates whether the value is a known member of the TransferRequestChain enum.
+func (e TransferRequestChain) Valid() bool {
 	switch e {
 	case Arbitrum:
 		return true
@@ -97,6 +169,39 @@ type ProblemDetails struct {
 	Type     string  `json:"type"`
 }
 
+// Transfer defines model for Transfer.
+type Transfer struct {
+	Amount                string             `json:"amount"`
+	Asset                 TransferAsset      `json:"asset"`
+	Chain                 TransferChain      `json:"chain"`
+	CreatedAt             time.Time          `json:"createdAt"`
+	DestinationCustomerId openapi_types.UUID `json:"destinationCustomerId"`
+	Id                    openapi_types.UUID `json:"id"`
+	SourceCustomerId      openapi_types.UUID `json:"sourceCustomerId"`
+}
+
+// TransferAsset defines model for Transfer.Asset.
+type TransferAsset string
+
+// TransferChain defines model for Transfer.Chain.
+type TransferChain string
+
+// TransferRequest defines model for TransferRequest.
+type TransferRequest struct {
+	// Amount Integer base units (wei for ETH, 6-decimal units for USDC), encoded as a string — never a JSON number — matching Balance's convention. Must be a positive integer.
+	Amount                string               `json:"amount"`
+	Asset                 TransferRequestAsset `json:"asset"`
+	Chain                 TransferRequestChain `json:"chain"`
+	DestinationCustomerId openapi_types.UUID   `json:"destinationCustomerId"`
+	SourceCustomerId      openapi_types.UUID   `json:"sourceCustomerId"`
+}
+
+// TransferRequestAsset defines model for TransferRequest.Asset.
+type TransferRequestAsset string
+
+// TransferRequestChain defines model for TransferRequest.Chain.
+type TransferRequestChain string
+
 // IdempotencyKey defines model for IdempotencyKey.
 type IdempotencyKey = string
 
@@ -108,6 +213,14 @@ type CreateCustomerParams struct {
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
 }
 
+// CreateTransferParams defines parameters for CreateTransfer.
+type CreateTransferParams struct {
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
+}
+
+// CreateTransferJSONRequestBody defines body for CreateTransfer for application/json ContentType.
+type CreateTransferJSONRequestBody = TransferRequest
+
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
 	// Create a customer and provision its per-asset accounts
@@ -116,6 +229,9 @@ type ServerInterface interface {
 	// Query a customer's current balance for each supported asset and chain
 	// (GET /customers/{id}/balances)
 	GetCustomerBalances(w http.ResponseWriter, r *http.Request, id openapi_types.UUID)
+	// Move balance from one customer to another, ledger-only, no chain interaction
+	// (POST /transfers)
+	CreateTransfer(w http.ResponseWriter, r *http.Request, params CreateTransferParams)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -201,6 +317,57 @@ func (siw *ServerInterfaceWrapper) GetCustomerBalances(w http.ResponseWriter, r 
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetCustomerBalances(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateTransfer operation middleware
+func (siw *ServerInterfaceWrapper) CreateTransfer(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateTransferParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey IdempotencyKey
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateTransfer(w, r, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -332,6 +499,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/customers", wrapper.CreateCustomer)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/balances", wrapper.GetCustomerBalances)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/transfers", wrapper.CreateTransfer)
 
 	return m
 }
@@ -341,26 +509,34 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"zFfbbttGEP2VwbZAYpSW7MZJEb0pttu6RdM0F/TB9cOKOxI3IXfZ2VklQiCgH9Ev7JcUs0tJtMTGeSjg",
-	"vFGcvZy5nMOjj6r0TesdOg5q8lG1mnSDjJR+XRlsWs/oytXPuJI31qmJqlAbJFUopxtUk/6yY1lXKMI/",
-	"oyU0asIUsVChrLDRcgCvWtkSmKxbqPV6vQmmC5/pWrsSExLyLRJbTAEdArI8oIuNmlwr5EoVKgZTqpti",
-	"/9RCzXYHGQwl2ZatF+xXjnGBBDMdEKKzHODhe7Qw9wSXr38s4MmxwdI2uu6iEnjz6uL8qAB0pTdoQAfQ",
-	"kO+Cf/76GxwukUDDT69+fQ4uNjOk9J496KW3Bua11/zkDFrC0gbrHdQ+hNEfTg1ALystVd6lKlBVoTTN",
-	"LFNsBvJd9yt+3Z1QdEXbFWO30c/eYslyW1fx8BJD610YKH23Oz1bxiY9fE04VxP11Xg3PuOuj+NNE9fb",
-	"6zSRXh3A3B48hOs8BvYN0iGeklAzmmkah7mnRrOaKKMZj9k2OFRSa26tjdEadVcR05LdXUMYX5Cf1dhc",
-	"IGtbh0OkJgUGpr5Q1gXeDOhBMLDmGHohm4c2VdRyPbwrv+inSfbOLFN0c+r25sNkBRWWkSyvXkmbu9FA",
-	"TUjTyJX8Sv2XTfn17u6Kuc1Ut27uhzlJTtcwfXGV+MYVgrELy7qGNMTwXtc1MrS1ZslvBJdLpBU0kTUL",
-	"DclHRugyC5ARgI5coWNbarkJtDOgHezJFWQ5g4fTi+PTs6MRXBJ5ChADwsvvz+Hp2ePvQLdt3R0zbnPb",
-	"v3kbvOs4nJuiLjrM04T594z5RYdZslOFWiKFnPbp6ET65lt0urVqoh6NTkaPVKFazVWq77jsWJCHywc+",
-	"LN5r/Q4DOJ+Sx8Aw82aV5EfDZjtUOi0pBREdhyjZoIG5xdoEsA6WpyOYulXeHNAx2AB24TyhGcHrSmqb",
-	"BUIC0p+OGrs73luuQBRzgQ4pxazJ9RFSpNpdGTVR52nnluDFrY/O9bC27JaM9z5K6xuZ6Iwtlenbk9Mk",
-	"E94xulSwfvOkadth1XdJ2RZkmt7bhd/ENpWQXp6dnHzi7v7gfD6GPZUZQPJMm233H+JoMYLGhiC0GB71",
-	"owz19B6g/tIB8wTWLXVtzYar7N+hy8Ce3gOw/UoRxoAmD7UGY+dzJKFFn2WC9vG9dPyNww8tlsKxgCTu",
-	"A0W0sk7HptG02hKtrwOigC35ZTYhQtYW6ThLrC5LH8UGyiE75Rl/tGY97puABQ7I0KUuK+hWiUQYJLsU",
-	"iSHfJL2o0SyQHgQQGbNuEYqtbwosMgNLXUdMMvzoaATTJqEBTQj20LSJwH2Wb0sre84tmbT8NdxCyJ4t",
-	"FJ/n2G6r2Q/IGyXYeKlDSUu2WWR9Z5qTv/hvn3yXWTlUvZP/TfUOPOGn1G87GV+2ppzdA7Dnfu/rKDxY",
-	"2CU6sAbwgw0cvnQN+S2Kz9pJyIMAZaQkhRu2C9NQ6C++whMnniVFcQbyf5F130AmRvSt4/WNjHMGkfkS",
-	"qVYTNV6eqvXN+t8AAAD//w==",
+	"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",
+	"EgAA//8=",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

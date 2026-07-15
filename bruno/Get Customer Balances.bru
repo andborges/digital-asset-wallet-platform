@@ -1,0 +1,23 @@
+meta {
+  name: Get Customer Balances
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/customers/:id/balances
+  body: none
+  auth: inherit
+}
+
+params:path {
+  id: {{customerId}}
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+}
+
+docs {
+  Set the environment's customerId var to an id returned by Create Customer.
+}

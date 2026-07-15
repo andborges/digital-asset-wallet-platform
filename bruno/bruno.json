@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "name": "digital-asset-wallet-platform",
+  "type": "collection",
+  "ignore": [
+    "node_modules",
+    ".git"
+  ]
+}

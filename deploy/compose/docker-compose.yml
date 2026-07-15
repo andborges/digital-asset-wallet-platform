@@ -35,6 +35,15 @@ services:
       postgres:
         condition: service_healthy
 
+  swagger-ui:
+    image: swaggerapi/swagger-ui
+    environment:
+      SWAGGER_JSON: /spec/openapi.yaml
+    ports:
+      - "8081:8080"
+    volumes:
+      - ../../api/openapi.yaml:/spec/openapi.yaml:ro
+
 # later epics add watcher/broadcaster/recon/dispatcher services here — do not add them
 # now, their subcommands don't exist until Epics 2-4.
 

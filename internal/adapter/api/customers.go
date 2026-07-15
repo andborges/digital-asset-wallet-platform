@@ -16,12 +16,13 @@ import (
 type customerServer struct {
 	createCustomer *core.CreateCustomer
 	getBalances    *core.GetCustomerBalances
+	createTransfer *core.CreateTransfer
 }
 
 // NewServerInterface constructs the generated ServerInterface implementation. Later
 // stories add their own use cases here as this service grows.
-func NewServerInterface(createCustomer *core.CreateCustomer, getBalances *core.GetCustomerBalances) ServerInterface {
-	return &customerServer{createCustomer: createCustomer, getBalances: getBalances}
+func NewServerInterface(createCustomer *core.CreateCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer) ServerInterface {
+	return &customerServer{createCustomer: createCustomer, getBalances: getBalances, createTransfer: createTransfer}
 }
 
 // CreateCustomer implements ServerInterface.CreateCustomer (POST /v1/customers).

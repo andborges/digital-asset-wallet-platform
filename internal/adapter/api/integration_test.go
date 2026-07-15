@@ -10,6 +10,7 @@ package api_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,8 +78,10 @@ func newTestHandler(t *testing.T) testEnv {
 	createCustomer := core.NewCreateCustomer(customerRepo)
 	balanceRepo := postgres.NewBalanceRepository(pool)
 	getBalances := core.NewGetCustomerBalances(balanceRepo)
+	transferRepo := postgres.NewTransferRepository()
+	createTransfer := core.NewCreateTransfer(transferRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
@@ -91,6 +94,55 @@ func newTestHandler(t *testing.T) testEnv {
 	handler = adapterapi.AuthMiddleware([]string{"test-token"})(handler)
 
 	return testEnv{handler: handler, pool: pool}
+}
+
+// creditAccount inserts a fixture journal entry + posting directly via test SQL,
+// crediting customerID's (chain, asset) account by amount — the same technique Story
+// 1.2 used to prove its derivation query was real, reused here to give a transfer test
+// a source balance to draw down without depending on any other write path.
+func creditAccount(t *testing.T, env testEnv, customerID, chain, asset, amount string) {
+	t.Helper()
+	ctx := context.Background()
+
+	var accountID string
+	if err := env.pool.QueryRow(ctx,
+		`SELECT id FROM accounts WHERE customer_id = $1 AND chain = $2 AND asset = $3`,
+		customerID, chain, asset,
+	).Scan(&accountID); err != nil {
+		t.Fatalf("look up account (%s, %s) for credit fixture: %v", chain, asset, err)
+	}
+
+	journalEntryID := uuid.New().String()
+	if _, err := env.pool.Exec(ctx,
+		`INSERT INTO journal_entries (id, cause_type, cause_id) VALUES ($1, 'test_fixture', $2)`,
+		journalEntryID, journalEntryID,
+	); err != nil {
+		t.Fatalf("insert journal_entries fixture row: %v", err)
+	}
+	if _, err := env.pool.Exec(ctx,
+		`INSERT INTO postings (id, journal_entry_id, account_id, amount) VALUES ($1, $2, $3, $4)`,
+		uuid.New().String(), journalEntryID, accountID, amount,
+	); err != nil {
+		t.Fatalf("insert postings fixture row: %v", err)
+	}
+}
+
+// postTransfer issues a POST /v1/transfers request with the given fields and returns
+// the recorded response. An empty idempotencyKey omits the header entirely (AC5).
+func postTransfer(t *testing.T, env testEnv, idempotencyKey, sourceID, destID, chain, asset, amount string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := fmt.Sprintf(
+		`{"sourceCustomerId":%q,"destinationCustomerId":%q,"chain":%q,"asset":%q,"amount":%q}`,
+		sourceID, destID, chain, asset, amount,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfers", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
 }
 
 // createTestCustomer creates a customer through the real HTTP stack (reusing the
@@ -374,4 +426,219 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 		}
 	})
+}
+
+func TestCreateTransfer_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("AC1: successful transfer moves balance atomically", func(t *testing.T) {
+		source := createTestCustomer(t, env, "transfer-e2e-source-1")
+		dest := createTestCustomer(t, env, "transfer-e2e-dest-1")
+		creditAccount(t, env, source, "base", "eth", "1000")
+
+		rec := postTransfer(t, env, "transfer-e2e-key-1", source, dest, "base", "eth", "400")
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+		}
+
+		var body struct {
+			ID                    string `json:"id"`
+			SourceCustomerID      string `json:"sourceCustomerId"`
+			DestinationCustomerID string `json:"destinationCustomerId"`
+			Chain                 string `json:"chain"`
+			Asset                 string `json:"asset"`
+			Amount                string `json:"amount"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if body.ID == "" {
+			t.Fatal("expected a non-empty transfer id")
+		}
+		if body.SourceCustomerID != source || body.DestinationCustomerID != dest {
+			t.Fatalf("body = %+v, want source=%s dest=%s", body, source, dest)
+		}
+		if body.Amount != "400" {
+			t.Fatalf("amount = %q, want %q", body.Amount, "400")
+		}
+
+		assertBalance(t, env, source, "base", "eth", "600")
+		assertBalance(t, env, dest, "base", "eth", "400")
+	})
+
+	t.Run("AC2: insufficient balance is rejected and writes nothing", func(t *testing.T) {
+		source := createTestCustomer(t, env, "transfer-e2e-source-2")
+		dest := createTestCustomer(t, env, "transfer-e2e-dest-2")
+		creditAccount(t, env, source, "base", "eth", "100")
+
+		beforeCount := postingsCount(t, env)
+
+		rec := postTransfer(t, env, "transfer-e2e-key-2", source, dest, "base", "eth", "101")
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+		}
+
+		if got := postingsCount(t, env); got != beforeCount {
+			t.Fatalf("postings count = %d, want unchanged %d", got, beforeCount)
+		}
+		assertBalance(t, env, source, "base", "eth", "100")
+	})
+
+	t.Run("AC3 & AC4: replaying the same Idempotency-Key moves balance only once, cause is recorded exactly once", func(t *testing.T) {
+		source := createTestCustomer(t, env, "transfer-e2e-source-3")
+		dest := createTestCustomer(t, env, "transfer-e2e-dest-3")
+		creditAccount(t, env, source, "base", "eth", "1000")
+
+		key := "transfer-e2e-key-3"
+		rec1 := postTransfer(t, env, key, source, dest, "base", "eth", "250")
+		if rec1.Code != http.StatusCreated {
+			t.Fatalf("first request status = %d, want %d, body = %s", rec1.Code, http.StatusCreated, rec1.Body.String())
+		}
+
+		rec2 := postTransfer(t, env, key, source, dest, "base", "eth", "250")
+		if rec2.Code != rec1.Code || rec2.Body.String() != rec1.Body.String() {
+			t.Fatalf("replay status/body = %d/%q, want byte-for-byte match with original %d/%q",
+				rec2.Code, rec2.Body.String(), rec1.Code, rec1.Body.String())
+		}
+
+		assertBalance(t, env, source, "base", "eth", "750")
+		assertBalance(t, env, dest, "base", "eth", "250")
+
+		var journalCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM journal_entries WHERE cause_type = 'internal_transfer' AND cause_id = $1`,
+			key,
+		).Scan(&journalCount); err != nil {
+			t.Fatalf("query journal_entries: %v", err)
+		}
+		if journalCount != 1 {
+			t.Fatalf("journal_entries rows for cause_id %q = %d, want exactly 1", key, journalCount)
+		}
+	})
+
+	t.Run("AC5: missing Idempotency-Key is rejected", func(t *testing.T) {
+		source := createTestCustomer(t, env, "transfer-e2e-source-4")
+		dest := createTestCustomer(t, env, "transfer-e2e-dest-4")
+
+		rec := postTransfer(t, env, "", source, dest, "base", "eth", "1")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("AC6: missing bearer token is rejected", func(t *testing.T) {
+		source := createTestCustomer(t, env, "transfer-e2e-source-5")
+		dest := createTestCustomer(t, env, "transfer-e2e-dest-5")
+
+		body := fmt.Sprintf(`{"sourceCustomerId":%q,"destinationCustomerId":%q,"chain":"base","asset":"eth","amount":"1"}`, source, dest)
+		req := httptest.NewRequest(http.MethodPost, "/v1/transfers", strings.NewReader(body))
+		req.Header.Set("Idempotency-Key", "transfer-e2e-key-6")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("AC7: unknown source or destination customer returns 404", func(t *testing.T) {
+		known := createTestCustomer(t, env, "transfer-e2e-source-7")
+		unknown := uuid.New().String()
+
+		beforeCount := postingsCount(t, env)
+
+		rec := postTransfer(t, env, "transfer-e2e-key-7a", unknown, known, "base", "eth", "1")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("unknown source: status = %d, want %d, body = %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+
+		rec2 := postTransfer(t, env, "transfer-e2e-key-7b", known, unknown, "base", "eth", "1")
+		if rec2.Code != http.StatusNotFound {
+			t.Fatalf("unknown destination: status = %d, want %d, body = %s", rec2.Code, http.StatusNotFound, rec2.Body.String())
+		}
+
+		// AC7's second clause: an unknown customer writes no postings.
+		if got := postingsCount(t, env); got != beforeCount {
+			t.Fatalf("postings count = %d, want unchanged %d after 404s", got, beforeCount)
+		}
+	})
+
+	t.Run("AC8: self-transfer and non-positive amounts are rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "transfer-e2e-source-8")
+
+		rec := postTransfer(t, env, "transfer-e2e-key-8a", customerID, customerID, "base", "eth", "1")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("self-transfer: status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		other := createTestCustomer(t, env, "transfer-e2e-dest-8")
+		rec2 := postTransfer(t, env, "transfer-e2e-key-8b", customerID, other, "base", "eth", "0")
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("zero amount: status = %d, want %d, body = %s", rec2.Code, http.StatusBadRequest, rec2.Body.String())
+		}
+
+		rec3 := postTransfer(t, env, "transfer-e2e-key-8c", customerID, other, "base", "eth", "-1")
+		if rec3.Code != http.StatusBadRequest {
+			t.Fatalf("negative amount: status = %d, want %d, body = %s", rec3.Code, http.StatusBadRequest, rec3.Body.String())
+		}
+	})
+
+	t.Run("AC9: unsupported chain or asset is rejected with 400, not 404", func(t *testing.T) {
+		source := createTestCustomer(t, env, "transfer-e2e-source-9")
+		dest := createTestCustomer(t, env, "transfer-e2e-dest-9")
+
+		rec := postTransfer(t, env, "transfer-e2e-key-9a", source, dest, "polygon", "eth", "1")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("invalid chain: status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		rec2 := postTransfer(t, env, "transfer-e2e-key-9b", source, dest, "base", "btc", "1")
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("invalid asset: status = %d, want %d, body = %s", rec2.Code, http.StatusBadRequest, rec2.Body.String())
+		}
+	})
+}
+
+// assertBalance queries the balances endpoint and asserts the (chain, asset) balance
+// for customerID equals want.
+func assertBalance(t *testing.T, env testEnv, customerID, chain, asset, want string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID+"/balances", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get balances status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body struct {
+		Balances []struct {
+			Chain   string `json:"chain"`
+			Asset   string `json:"asset"`
+			Balance string `json:"balance"`
+		} `json:"balances"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode balances response: %v", err)
+	}
+	for _, b := range body.Balances {
+		if b.Chain == chain && b.Asset == asset {
+			if b.Balance != want {
+				t.Fatalf("balance for %s/%s = %q, want %q", chain, asset, b.Balance, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("no balance entry found for %s/%s", chain, asset)
+}
+
+// postingsCount returns the total number of rows in the postings table, used to assert
+// a rejected transfer wrote nothing.
+func postingsCount(t *testing.T, env testEnv) int {
+	t.Helper()
+	var count int
+	if err := env.pool.QueryRow(context.Background(), `SELECT count(*) FROM postings`).Scan(&count); err != nil {
+		t.Fatalf("count postings: %v", err)
+	}
+	return count
 }

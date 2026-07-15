@@ -86,8 +86,10 @@ func runAPI(logger *slog.Logger) error {
 	createCustomer := core.NewCreateCustomer(customerRepo)
 	balanceRepo := postgres.NewBalanceRepository(pool)
 	getBalances := core.NewGetCustomerBalances(balanceRepo)
+	transferRepo := postgres.NewTransferRepository()
+	createTransfer := core.NewCreateTransfer(transferRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,

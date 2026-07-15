@@ -1,0 +1,29 @@
+meta {
+  name: Create Customer
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/customers
+  body: none
+  auth: inherit
+}
+
+headers {
+  Idempotency-Key: {{idempotencyKey}}
+}
+
+script:pre-request {
+  bru.setVar("idempotencyKey", `create-customer-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+}
+
+docs {
+  Takes no request body — a customer has no caller-supplied fields in v1.
+  Copy the returned "id" into the environment's sourceCustomerId/destinationCustomerId/
+  customerId vars to use in the other two requests.
+}

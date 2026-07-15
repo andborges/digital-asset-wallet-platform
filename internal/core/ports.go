@@ -24,6 +24,23 @@ type BalanceRepository interface {
 	CustomerBalances(ctx context.Context, customerID string) ([]AccountBalance, error)
 }
 
+// TransferRepository persists a ledger-only internal transfer (FR4) as one balanced
+// journal entry (debit source, credit destination) plus its postings (AD-3, AD-4).
+// Like CustomerRepository, implementations must run their writes against whatever
+// transaction is already open on ctx (established by IdempotencyMiddleware for this
+// mutating POST) rather than opening their own.
+type TransferRepository interface {
+	// CreateTransfer locks both accounts in a single deterministic-order statement
+	// (preventing lock-ordering deadlocks between opposite-direction concurrent
+	// transfers), verifies the source account's derived balance covers req.Amount, and
+	// writes the journal entry plus two postings atomically. Returns
+	// ErrCustomerNotFound if either customer has no account for (req.Chain, req.Asset),
+	// ErrInsufficientBalance if the source's derived balance is less than req.Amount,
+	// or ErrDuplicateTransferCause on a duplicate cause_id (a narrow concurrent-request
+	// race — see internal/adapter/postgres/transfer_repo.go).
+	CreateTransfer(ctx context.Context, req TransferRequest) (Transfer, error)
+}
+
 // Tx, TxBeginner, and IdempotencyStore below are cross-cutting architectural ports
 // (AD-4's one-transaction-per-state-change rule, AD-5's idempotency-by-constraint rule)
 // rather than ledger domain concepts. They live in core, not in internal/adapter/api,
