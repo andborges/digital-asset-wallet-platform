@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -74,8 +75,10 @@ func newTestHandler(t *testing.T) testEnv {
 	idempotencyStore := postgres.NewIdempotencyStore(pool)
 	customerRepo := postgres.NewCustomerRepository()
 	createCustomer := core.NewCreateCustomer(customerRepo)
+	balanceRepo := postgres.NewBalanceRepository(pool)
+	getBalances := core.NewGetCustomerBalances(balanceRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
@@ -88,6 +91,157 @@ func newTestHandler(t *testing.T) testEnv {
 	handler = adapterapi.AuthMiddleware([]string{"test-token"})(handler)
 
 	return testEnv{handler: handler, pool: pool}
+}
+
+// createTestCustomer creates a customer through the real HTTP stack (reusing the
+// already-tested creation path) and returns its id.
+func createTestCustomer(t *testing.T, env testEnv, idempotencyKey string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Idempotency-Key", idempotencyKey)
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create customer status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode create-customer response: %v", err)
+	}
+	return body.ID
+}
+
+func TestGetCustomerBalances_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("AC1 & AC3: zero balances for every (chain, asset) pair, returned quickly", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "balances-e2e-key-1")
+
+		start := time.Now()
+		req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID+"/balances", nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+		elapsed := time.Since(start)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		// AC3 sanity check: a single call against a locally-run testcontainer should be
+		// far under the 500ms p95 target. We record the timing but deliberately do NOT
+		// fail on it — a cold-start container under CI load can exceed 500ms without any
+		// real regression, and a wall-clock assertion in a functional test is flaky.
+		// Real load-based p95 measurement is Story 6.4's job, not this test's.
+		t.Logf("AC3 sanity: balances call took %s (target: well under 500ms; real p95 is Story 6.4)", elapsed)
+
+		var body struct {
+			Balances []struct {
+				Chain   string `json:"chain"`
+				Asset   string `json:"asset"`
+				Balance string `json:"balance"`
+			} `json:"balances"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(body.Balances) != 4 {
+			t.Fatalf("balances = %+v, want exactly 4 entries", body.Balances)
+		}
+		for _, b := range body.Balances {
+			if b.Balance != "0" {
+				t.Errorf("balance for %s/%s = %q, want \"0\"", b.Chain, b.Asset, b.Balance)
+			}
+		}
+	})
+
+	t.Run("AC2: unknown customer id returns 404", func(t *testing.T) {
+		unknownID := uuid.New().String()
+		req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+unknownID+"/balances", nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+			t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+		}
+	})
+
+	t.Run("AC4: balance reflects postings written directly to the ledger", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "balances-e2e-key-2")
+		ctx := context.Background()
+
+		var accountID string
+		if err := env.pool.QueryRow(ctx,
+			`SELECT id FROM accounts WHERE customer_id = $1 AND chain = 'base' AND asset = 'eth'`,
+			customerID,
+		).Scan(&accountID); err != nil {
+			t.Fatalf("look up test account: %v", err)
+		}
+
+		journalEntryID := uuid.New().String()
+		if _, err := env.pool.Exec(ctx,
+			`INSERT INTO journal_entries (id, cause_type, cause_id) VALUES ($1, 'test_fixture', $2)`,
+			journalEntryID, journalEntryID,
+		); err != nil {
+			t.Fatalf("insert journal_entries fixture row: %v", err)
+		}
+		if _, err := env.pool.Exec(ctx,
+			`INSERT INTO postings (id, journal_entry_id, account_id, amount) VALUES ($1, $2, $3, $4)`,
+			uuid.New().String(), journalEntryID, accountID, "1000000000000000000",
+		); err != nil {
+			t.Fatalf("insert postings fixture row: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID+"/balances", nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body struct {
+			Balances []struct {
+				Chain   string `json:"chain"`
+				Asset   string `json:"asset"`
+				Balance string `json:"balance"`
+			} `json:"balances"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		var found bool
+		for _, b := range body.Balances {
+			if b.Chain == "base" && b.Asset == "eth" {
+				found = true
+				if b.Balance != "1000000000000000000" {
+					t.Fatalf("base/eth balance = %q, want %q (derived from the fixture posting)", b.Balance, "1000000000000000000")
+				}
+			} else if b.Balance != "0" {
+				t.Errorf("balance for %s/%s = %q, want \"0\" (untouched account)", b.Chain, b.Asset, b.Balance)
+			}
+		}
+		if !found {
+			t.Fatal("expected a base/eth balance entry")
+		}
+	})
+
+	t.Run("AC5: missing bearer token is rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "balances-e2e-key-3")
+		req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID+"/balances", nil)
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
 }
 
 func TestCreateCustomer_EndToEnd(t *testing.T) {

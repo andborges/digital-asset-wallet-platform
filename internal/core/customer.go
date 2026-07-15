@@ -2,14 +2,22 @@
 // It imports nothing from internal/adapter/* (AD-1, AD-2) — adapters import core, never the reverse.
 package core
 
-import "time"
+import (
+	"errors"
+	"math/big"
+	"time"
+)
 
 // Customer is a platform customer. Balances are never stored on Customer or Account —
-// they are derived from postings starting Story 1.3 (AD-3).
+// they are always derived from postings (AD-3), starting this story's derivation query.
 type Customer struct {
 	ID        string
 	CreatedAt time.Time
 }
+
+// ErrCustomerNotFound is returned by BalanceRepository.CustomerBalances when no
+// customer with the given id exists.
+var ErrCustomerNotFound = errors.New("customer not found")
 
 // Chain identifies a supported EVM chain.
 type Chain string
@@ -40,11 +48,19 @@ var SupportedChainAssetPairs = []struct {
 }
 
 // Account is a per-customer, per-(chain, asset) ledger account. It carries no balance
-// field: balances are always derived from postings (AD-3), which don't exist until Story 1.3.
+// field: balances are always derived from postings (AD-3) via BalanceRepository.
 type Account struct {
 	ID         string
 	CustomerID string
 	Chain      Chain
 	Asset      Asset
 	CreatedAt  time.Time
+}
+
+// AccountBalance is a (chain, asset) balance derived from summing an account's
+// postings (AD-3) — never a stored value.
+type AccountBalance struct {
+	Chain   Chain
+	Asset   Asset
+	Balance *big.Int
 }

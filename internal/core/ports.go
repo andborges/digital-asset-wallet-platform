@@ -13,6 +13,17 @@ type CustomerRepository interface {
 	CreateCustomer(ctx context.Context, customer Customer, accounts []Account) error
 }
 
+// BalanceRepository reads a customer's per-(chain, asset) balances, derived by summing
+// postings (AD-3). Unlike CustomerRepository, implementations query independently of
+// any transaction on ctx — this is a plain read with no state change to commit, and the
+// idempotency middleware never opens a transaction for the non-mutating GET route this
+// port serves.
+type BalanceRepository interface {
+	// CustomerBalances returns one AccountBalance per (chain, asset) pair provisioned
+	// for customerID. Returns ErrCustomerNotFound if no such customer exists.
+	CustomerBalances(ctx context.Context, customerID string) ([]AccountBalance, error)
+}
+
 // Tx, TxBeginner, and IdempotencyStore below are cross-cutting architectural ports
 // (AD-4's one-transaction-per-state-change rule, AD-5's idempotency-by-constraint rule)
 // rather than ledger domain concepts. They live in core, not in internal/adapter/api,

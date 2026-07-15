@@ -84,8 +84,10 @@ func runAPI(logger *slog.Logger) error {
 	idempotencyStore := postgres.NewIdempotencyStore(pool)
 	customerRepo := postgres.NewCustomerRepository()
 	createCustomer := core.NewCreateCustomer(customerRepo)
+	balanceRepo := postgres.NewBalanceRepository(pool)
+	getBalances := core.NewGetCustomerBalances(balanceRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,

@@ -26,6 +26,62 @@ const (
 	BearerAuthScopes bearerAuthContextKey = "bearerAuth.Scopes"
 )
 
+// Defines values for BalanceAsset.
+const (
+	Eth  BalanceAsset = "eth"
+	Usdc BalanceAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the BalanceAsset enum.
+func (e BalanceAsset) Valid() bool {
+	switch e {
+	case Eth:
+		return true
+	case Usdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for BalanceChain.
+const (
+	Arbitrum BalanceChain = "arbitrum"
+	Base     BalanceChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the BalanceChain enum.
+func (e BalanceChain) Valid() bool {
+	switch e {
+	case Arbitrum:
+		return true
+	case Base:
+		return true
+	default:
+		return false
+	}
+}
+
+// Balance defines model for Balance.
+type Balance struct {
+	Asset BalanceAsset `json:"asset"`
+
+	// Balance Integer base units (wei for ETH, 6-decimal units for USDC), encoded as a string — never a JSON number — to avoid float64 precision loss.
+	Balance string       `json:"balance"`
+	Chain   BalanceChain `json:"chain"`
+}
+
+// BalanceAsset defines model for Balance.Asset.
+type BalanceAsset string
+
+// BalanceChain defines model for Balance.Chain.
+type BalanceChain string
+
+// BalancesResponse defines model for BalancesResponse.
+type BalancesResponse struct {
+	Balances []Balance `json:"balances"`
+}
+
 // Customer defines model for Customer.
 type Customer struct {
 	CreatedAt time.Time          `json:"createdAt"`
@@ -57,6 +113,9 @@ type ServerInterface interface {
 	// Create a customer and provision its per-asset accounts
 	// (POST /customers)
 	CreateCustomer(w http.ResponseWriter, r *http.Request, params CreateCustomerParams)
+	// Query a customer's current balance for each supported asset and chain
+	// (GET /customers/{id}/balances)
+	GetCustomerBalances(w http.ResponseWriter, r *http.Request, id openapi_types.UUID)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -110,6 +169,38 @@ func (siw *ServerInterfaceWrapper) CreateCustomer(w http.ResponseWriter, r *http
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.CreateCustomer(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetCustomerBalances operation middleware
+func (siw *ServerInterfaceWrapper) GetCustomerBalances(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id openapi_types.UUID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid"})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetCustomerBalances(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -240,6 +331,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	}
 
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/customers", wrapper.CreateCustomer)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/balances", wrapper.GetCustomerBalances)
 
 	return m
 }
@@ -249,20 +341,26 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"xFXNjiM1EH6VkuGwKzqdhJ0V2r6FmUUaIaQRLOIwzMHTrqS9222bcjlLNIrEQ/CEPAkqOz89SQR7m2O7",
-	"yq6vvqrv6yfV+iF4h46jap5U0KQHZKT8dWtwCJ7RtZsfcSMn1qlGdagNkqqU0wOqZpw2kbxKEf6RLKFR",
-	"DVPCSsW2w0HLA7wJciUyWbdS2+12H8wFr1NkPyBlKOQDElvMkZZQM5oFy8fS06BZNcpoxgnbAVV1+nKl",
-	"rHmWm5I152nbMdh7lVOOtR4O+f7xI7Ysz96Rf+xxuEHWto/nSE0OXOi1UtZF1q7Fi8HImlMchaxjXCFJ",
-	"jC33l2+Vg3GbZP+3yxzdv3qofN6soMI2keXNLzKk0uAjakJaJO7kK09PLpXjY+2OOZQBW7f0hZnYkg1s",
-	"vWzRrWMkp3tY3N3C0hNwh2DsyrLuQceIDJ913yND6DVLfzW8XyNtYEis2boVkE+MsOssQkEAOnGHjm2r",
-	"pRJoZ0A7OFlSKEsMrxY3k/nV6xreE3mKkCLCzz9cw7urt9+BDqHfPTMNZezffIze1b+7A32NutlhXmTM",
-	"vxXMdzvM0p2q1Boplrbn9Uzm5gM6Haxq1Jt6Vr9RlQqau8zvtN2poCyXj3xO3gf9CSM4n5vHyPDozQb+",
-	"+etv0LC/Dp3OKa0goklM0g0aWFrsTQTrYD2vYeE25XJEx2Aj2JXzhKaGD51wG4N3ESUg89lJ41jjs+UO",
-	"LEdYoUPKMWsKPyKKzN2tUY26zjcPAq+eWc39k/qacKka9dX0aEjTY8r0xIq2D7LRBVum6dvZPNuEd4wu",
-	"EzYengztsKzZhy6V2xnR9AAyb+9z4vexPRMyy6vZ7D9qjxfnyzGcuMwFJN9rc5j+K6xXNQw2RpHF5VV/",
-	"XaDOXwDqTztgnsC6te6t2WuV/Sd0Bdi7FwB2yhRhimjKUmswdrlEElmMVSZo377IxH91+GfAVjQWkdZI",
-	"gGJaxafTMGjaHIQ29gFxwEB+bcWCslgD0qRYrG5bn+Tnvx27fVbk2OfvH0RxpWrRa6JeNWq6nqvtw/bf",
-	"AAAA//8=",
+	"zFfbbttGEP2VwbZAYpSW7MZJEb0pttu6RdM0F/TB9cOKOxI3IXfZ2VklQiCgH9Ev7JcUs0tJtMTGeSjg",
+	"vFGcvZy5nMOjj6r0TesdOg5q8lG1mnSDjJR+XRlsWs/oytXPuJI31qmJqlAbJFUopxtUk/6yY1lXKMI/",
+	"oyU0asIUsVChrLDRcgCvWtkSmKxbqPV6vQmmC5/pWrsSExLyLRJbTAEdArI8oIuNmlwr5EoVKgZTqpti",
+	"/9RCzXYHGQwl2ZatF+xXjnGBBDMdEKKzHODhe7Qw9wSXr38s4MmxwdI2uu6iEnjz6uL8qAB0pTdoQAfQ",
+	"kO+Cf/76GxwukUDDT69+fQ4uNjOk9J496KW3Bua11/zkDFrC0gbrHdQ+hNEfTg1ALystVd6lKlBVoTTN",
+	"LFNsBvJd9yt+3Z1QdEXbFWO30c/eYslyW1fx8BJD610YKH23Oz1bxiY9fE04VxP11Xg3PuOuj+NNE9fb",
+	"6zSRXh3A3B48hOs8BvYN0iGeklAzmmkah7mnRrOaKKMZj9k2OFRSa26tjdEadVcR05LdXUMYX5Cf1dhc",
+	"IGtbh0OkJgUGpr5Q1gXeDOhBMLDmGHohm4c2VdRyPbwrv+inSfbOLFN0c+r25sNkBRWWkSyvXkmbu9FA",
+	"TUjTyJX8Sv2XTfn17u6Kuc1Ut27uhzlJTtcwfXGV+MYVgrELy7qGNMTwXtc1MrS1ZslvBJdLpBU0kTUL",
+	"DclHRugyC5ARgI5coWNbarkJtDOgHezJFWQ5g4fTi+PTs6MRXBJ5ChADwsvvz+Hp2ePvQLdt3R0zbnPb",
+	"v3kbvOs4nJuiLjrM04T594z5RYdZslOFWiKFnPbp6ET65lt0urVqoh6NTkaPVKFazVWq77jsWJCHywc+",
+	"LN5r/Q4DOJ+Sx8Aw82aV5EfDZjtUOi0pBREdhyjZoIG5xdoEsA6WpyOYulXeHNAx2AB24TyhGcHrSmqb",
+	"BUIC0p+OGrs73luuQBRzgQ4pxazJ9RFSpNpdGTVR52nnluDFrY/O9bC27JaM9z5K6xuZ6Iwtlenbk9Mk",
+	"E94xulSwfvOkadth1XdJ2RZkmt7bhd/ENpWQXp6dnHzi7v7gfD6GPZUZQPJMm233H+JoMYLGhiC0GB71",
+	"owz19B6g/tIB8wTWLXVtzYar7N+hy8Ce3gOw/UoRxoAmD7UGY+dzJKFFn2WC9vG9dPyNww8tlsKxgCTu",
+	"A0W0sk7HptG02hKtrwOigC35ZTYhQtYW6ThLrC5LH8UGyiE75Rl/tGY97puABQ7I0KUuK+hWiUQYJLsU",
+	"iSHfJL2o0SyQHgQQGbNuEYqtbwosMgNLXUdMMvzoaATTJqEBTQj20LSJwH2Wb0sre84tmbT8NdxCyJ4t",
+	"FJ/n2G6r2Q/IGyXYeKlDSUu2WWR9Z5qTv/hvn3yXWTlUvZP/TfUOPOGn1G87GV+2ppzdA7Dnfu/rKDxY",
+	"2CU6sAbwgw0cvnQN+S2Kz9pJyIMAZaQkhRu2C9NQ6C++whMnniVFcQbyf5F130AmRvSt4/WNjHMGkfkS",
+	"qVYTNV6eqvXN+t8AAAD//w==",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

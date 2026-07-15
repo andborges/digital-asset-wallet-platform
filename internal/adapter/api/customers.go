@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -10,16 +11,17 @@ import (
 )
 
 // customerServer implements the generated ServerInterface. It holds no state of its
-// own beyond the use case it delegates to — all persistence and transaction handling
-// happens through core.CreateCustomer and the ports it was constructed with.
+// own beyond the use cases it delegates to — all persistence and transaction handling
+// happens through the core use cases and the ports they were constructed with.
 type customerServer struct {
 	createCustomer *core.CreateCustomer
+	getBalances    *core.GetCustomerBalances
 }
 
-// NewServerInterface constructs the generated ServerInterface implementation for this
-// story's one route. Later stories add their own use cases here as this service grows.
-func NewServerInterface(createCustomer *core.CreateCustomer) ServerInterface {
-	return &customerServer{createCustomer: createCustomer}
+// NewServerInterface constructs the generated ServerInterface implementation. Later
+// stories add their own use cases here as this service grows.
+func NewServerInterface(createCustomer *core.CreateCustomer, getBalances *core.GetCustomerBalances) ServerInterface {
+	return &customerServer{createCustomer: createCustomer, getBalances: getBalances}
 }
 
 // CreateCustomer implements ServerInterface.CreateCustomer (POST /v1/customers).
@@ -48,4 +50,33 @@ func (s *customerServer) CreateCustomer(w http.ResponseWriter, r *http.Request, 
 		Id:        id,
 		CreatedAt: customer.CreatedAt,
 	})
+}
+
+// GetCustomerBalances implements ServerInterface.GetCustomerBalances
+// (GET /v1/customers/{id}/balances). This route is non-mutating: IdempotencyMiddleware
+// passes it straight through without opening a transaction (Story 1.1's non-mutating
+// bypass), so s.getBalances reads independently via its own pool, not r.Context()'s tx.
+func (s *customerServer) GetCustomerBalances(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	balances, err := s.getBalances.Execute(r.Context(), id.String())
+	if errors.Is(err, core.ErrCustomerNotFound) {
+		WriteProblem(w, http.StatusNotFound, "customer-not-found", err.Error(), r.URL.Path)
+		return
+	}
+	if err != nil {
+		WriteProblem(w, http.StatusInternalServerError, "get-balances-failed", err.Error(), r.URL.Path)
+		return
+	}
+
+	resp := BalancesResponse{Balances: make([]Balance, 0, len(balances))}
+	for _, b := range balances {
+		resp.Balances = append(resp.Balances, Balance{
+			Chain:   BalanceChain(b.Chain),
+			Asset:   BalanceAsset(b.Asset),
+			Balance: b.Balance.String(),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
