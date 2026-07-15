@@ -80,8 +80,10 @@ func newTestHandler(t *testing.T) testEnv {
 	getBalances := core.NewGetCustomerBalances(balanceRepo)
 	transferRepo := postgres.NewTransferRepository()
 	createTransfer := core.NewCreateTransfer(transferRepo)
+	transactionRepo := postgres.NewTransactionRepository(pool, []byte("test-cursor-signing-key"))
+	listTransactions := core.NewListCustomerTransactions(transactionRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer, listTransactions)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
@@ -641,4 +643,314 @@ func postingsCount(t *testing.T, env testEnv) int {
 		t.Fatalf("count postings: %v", err)
 	}
 	return count
+}
+
+// transactionsResponseBody decodes a GET .../transactions response body.
+type transactionsResponseBody struct {
+	Transactions []struct {
+		ID        string    `json:"id"`
+		Type      string    `json:"type"`
+		Amount    string    `json:"amount"`
+		Chain     string    `json:"chain"`
+		Asset     string    `json:"asset"`
+		Status    string    `json:"status"`
+		CreatedAt time.Time `json:"createdAt"`
+	} `json:"transactions"`
+	NextCursor string `json:"nextCursor"`
+}
+
+// flipChar returns a different but still valid base64url character, used to tamper with a
+// cursor in a way that keeps it well-formed base64 (so the rejection exercises the HMAC
+// check, not merely a base64 decode failure).
+func flipChar(c byte) string {
+	if c == 'A' {
+		return "B"
+	}
+	return "A"
+}
+
+// getTransactions issues a GET /v1/customers/{id}/transactions request with an optional
+// raw query string (e.g. "cursor=...&pageSize=3") and returns the recorded response.
+func getTransactions(t *testing.T, env testEnv, customerID, rawQuery string) *httptest.ResponseRecorder {
+	t.Helper()
+	url := "/v1/customers/" + customerID + "/transactions"
+	if rawQuery != "" {
+		url += "?" + rawQuery
+	}
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestListCustomerTransactions_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("AC1: a completed transfer appears on both sides, signed from each customer's own perspective", func(t *testing.T) {
+		source := createTestCustomer(t, env, "txn-e2e-source-1")
+		dest := createTestCustomer(t, env, "txn-e2e-dest-1")
+		creditAccount(t, env, source, "base", "eth", "1000")
+
+		transferRec := postTransfer(t, env, "txn-e2e-transfer-key-1", source, dest, "base", "eth", "400")
+		if transferRec.Code != http.StatusCreated {
+			t.Fatalf("transfer status = %d, want %d, body = %s", transferRec.Code, http.StatusCreated, transferRec.Body.String())
+		}
+
+		sourceRec := getTransactions(t, env, source, "")
+		if sourceRec.Code != http.StatusOK {
+			t.Fatalf("source history status = %d, want %d, body = %s", sourceRec.Code, http.StatusOK, sourceRec.Body.String())
+		}
+		var sourceBody transactionsResponseBody
+		if err := json.Unmarshal(sourceRec.Body.Bytes(), &sourceBody); err != nil {
+			t.Fatalf("decode source history: %v", err)
+		}
+		// Source's history also contains the creditAccount fixture row (cause_type
+		// "test_fixture") used to fund it — which is itself a live demonstration of AC4's
+		// genericity (a cause_type this endpoint has never heard of still shows up
+		// unfiltered), so assert on the specific internal_transfer entry rather than the
+		// list's total length.
+		var st *struct {
+			ID        string    `json:"id"`
+			Type      string    `json:"type"`
+			Amount    string    `json:"amount"`
+			Chain     string    `json:"chain"`
+			Asset     string    `json:"asset"`
+			Status    string    `json:"status"`
+			CreatedAt time.Time `json:"createdAt"`
+		}
+		for i := range sourceBody.Transactions {
+			if sourceBody.Transactions[i].Type == "internal_transfer" {
+				st = &sourceBody.Transactions[i]
+				break
+			}
+		}
+		if st == nil {
+			t.Fatalf("no internal_transfer entry found in source transactions: %+v", sourceBody.Transactions)
+		}
+		if st.Amount != "-400" || st.Chain != "base" || st.Asset != "eth" || st.Status != "completed" {
+			t.Fatalf("source transaction = %+v, want amount=-400 chain=base asset=eth status=completed", *st)
+		}
+		if st.CreatedAt.IsZero() {
+			t.Fatal("expected a non-zero createdAt timestamp")
+		}
+
+		destRec := getTransactions(t, env, dest, "")
+		if destRec.Code != http.StatusOK {
+			t.Fatalf("dest history status = %d, want %d, body = %s", destRec.Code, http.StatusOK, destRec.Body.String())
+		}
+		var destBody transactionsResponseBody
+		if err := json.Unmarshal(destRec.Body.Bytes(), &destBody); err != nil {
+			t.Fatalf("decode dest history: %v", err)
+		}
+		if len(destBody.Transactions) != 1 {
+			t.Fatalf("dest transactions = %+v, want exactly 1", destBody.Transactions)
+		}
+		dt := destBody.Transactions[0]
+		if dt.Type != "internal_transfer" || dt.Amount != "400" || dt.Chain != "base" || dt.Asset != "eth" || dt.Status != "completed" {
+			t.Fatalf("dest transaction = %+v, want type=internal_transfer amount=400 chain=base asset=eth status=completed", dt)
+		}
+	})
+
+	t.Run("AC2: a customer with no transactions gets an empty paginated list, not an error", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "txn-e2e-empty-1")
+
+		rec := getTransactions(t, env, customerID, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body transactionsResponseBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(body.Transactions) != 0 {
+			t.Fatalf("transactions = %+v, want empty", body.Transactions)
+		}
+		if body.NextCursor != "" {
+			t.Fatalf("nextCursor = %q, want empty (no pages at all)", body.NextCursor)
+		}
+	})
+
+	t.Run("AC3: paginates with stable newest-first ordering, no duplicates and no gaps across pages", func(t *testing.T) {
+		source := createTestCustomer(t, env, "txn-e2e-page-source-1")
+		dest := createTestCustomer(t, env, "txn-e2e-page-dest-1")
+		creditAccount(t, env, source, "base", "eth", "1000")
+
+		const numTransfers = 7
+		for i := 0; i < numTransfers; i++ {
+			key := fmt.Sprintf("txn-e2e-page-key-%d", i)
+			rec := postTransfer(t, env, key, source, dest, "base", "eth", "1")
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("transfer %d status = %d, want %d, body = %s", i, rec.Code, http.StatusCreated, rec.Body.String())
+			}
+		}
+
+		// Paginate over dest, not source: source's history also carries the
+		// creditAccount funding fixture (a "test_fixture" row), which would make the
+		// exactly-numTransfers count below wrong. dest never receives that fixture — its
+		// history is exactly the numTransfers credits from the loop above.
+		var seenIDs []string
+		var seenCreatedAt []time.Time
+		cursor := ""
+		for page := 0; ; page++ {
+			if page > numTransfers {
+				t.Fatal("paginated more times than there are transactions — nextCursor is not converging")
+			}
+			query := "pageSize=3"
+			if cursor != "" {
+				query += "&cursor=" + cursor
+			}
+			rec := getTransactions(t, env, dest, query)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("page %d status = %d, want %d, body = %s", page, rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var body transactionsResponseBody
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode page %d: %v", page, err)
+			}
+			for _, txn := range body.Transactions {
+				seenIDs = append(seenIDs, txn.ID)
+				seenCreatedAt = append(seenCreatedAt, txn.CreatedAt)
+			}
+			if body.NextCursor == "" {
+				break
+			}
+			cursor = body.NextCursor
+		}
+
+		if len(seenIDs) != numTransfers {
+			t.Fatalf("total transactions seen across all pages = %d, want exactly %d (no gaps/dups): %v", len(seenIDs), numTransfers, seenIDs)
+		}
+		seen := make(map[string]bool, len(seenIDs))
+		for _, id := range seenIDs {
+			if seen[id] {
+				t.Fatalf("transaction id %s seen more than once across pages: %v", id, seenIDs)
+			}
+			seen[id] = true
+		}
+		// Assert the *strict total order* the keyset design guarantees, not just
+		// non-ascending createdAt: newest-first on createdAt, and on a createdAt tie
+		// (same-instant rows, reachable in a fast test loop) descending on id. This is the
+		// exact ordering the (created_at, id) cursor comparison relies on to never skip or
+		// repeat a row across a page boundary — asserting createdAt alone would let a
+		// tie-ordering regression through.
+		for i := 1; i < len(seenCreatedAt); i++ {
+			switch {
+			case seenCreatedAt[i].After(seenCreatedAt[i-1]):
+				t.Fatalf("ordering not newest-first at index %d: %v is after %v", i, seenCreatedAt[i], seenCreatedAt[i-1])
+			case seenCreatedAt[i].Equal(seenCreatedAt[i-1]) && seenIDs[i] >= seenIDs[i-1]:
+				// UUID canonical text sorts lexicographically the same as Postgres's uuid
+				// byte order, so a string compare is a faithful stand-in for the DB tiebreak.
+				t.Fatalf("createdAt tie at index %d not broken by descending id: %s >= %s", i, seenIDs[i], seenIDs[i-1])
+			}
+		}
+	})
+
+	t.Run("AC5: unknown customer id returns 404", func(t *testing.T) {
+		unknownID := uuid.New().String()
+		rec := getTransactions(t, env, unknownID, "")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+	})
+
+	t.Run("AC6: missing bearer token is rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "txn-e2e-auth-1")
+		req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID+"/transactions", nil)
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("AC7: a garbage cursor is rejected with 400, not 500", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "txn-e2e-cursor-1")
+		rec := getTransactions(t, env, customerID, "cursor=not-a-real-cursor")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("AC7: a tampered or cross-customer cursor is rejected with 400, not silently honored", func(t *testing.T) {
+		// Build a real, valid cursor: fund source, send it 3 transfers, page dest at
+		// pageSize=2 so a nextCursor is produced.
+		source := createTestCustomer(t, env, "txn-e2e-cursor-tamper-source")
+		dest := createTestCustomer(t, env, "txn-e2e-cursor-tamper-dest")
+		creditAccount(t, env, source, "base", "eth", "1000")
+		for i := 0; i < 3; i++ {
+			key := fmt.Sprintf("txn-e2e-cursor-tamper-key-%d", i)
+			if rec := postTransfer(t, env, key, source, dest, "base", "eth", "1"); rec.Code != http.StatusCreated {
+				t.Fatalf("transfer %d status = %d, body = %s", i, rec.Code, rec.Body.String())
+			}
+		}
+
+		firstRec := getTransactions(t, env, dest, "pageSize=2")
+		if firstRec.Code != http.StatusOK {
+			t.Fatalf("first page status = %d, want %d, body = %s", firstRec.Code, http.StatusOK, firstRec.Body.String())
+		}
+		var firstBody transactionsResponseBody
+		if err := json.Unmarshal(firstRec.Body.Bytes(), &firstBody); err != nil {
+			t.Fatalf("decode first page: %v", err)
+		}
+		validCursor := firstBody.NextCursor
+		if validCursor == "" {
+			t.Fatal("expected a nextCursor on the first of multiple pages")
+		}
+
+		// Sanity: the untampered cursor works for its own customer.
+		if rec := getTransactions(t, env, dest, "cursor="+validCursor); rec.Code != http.StatusOK {
+			t.Fatalf("valid cursor replayed by its own customer: status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		// Tampered: flip the first character of the well-formed cursor (a payload byte, so
+		// the change is always significant — unlike the trailing base64 char of the MAC,
+		// whose low bits are non-significant padding and can decode unchanged). The HMAC no
+		// longer matches, so it must be rejected — never treated as a valid page origin.
+		tampered := flipChar(validCursor[0]) + validCursor[1:]
+		if rec := getTransactions(t, env, dest, "cursor="+tampered); rec.Code != http.StatusBadRequest {
+			t.Fatalf("tampered cursor: status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		// From a different customer: dest's own valid cursor, replayed against another
+		// existing customer, must 400 (customer binding) — not return that customer's rows.
+		other := createTestCustomer(t, env, "txn-e2e-cursor-tamper-other")
+		if rec := getTransactions(t, env, other, "cursor="+validCursor); rec.Code != http.StatusBadRequest {
+			t.Fatalf("cross-customer cursor: status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("AC8: invalid pageSize is rejected with 400; an oversized pageSize is clamped, not rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "txn-e2e-pagesize-1")
+
+		// An explicit pageSize=0 is present and not a positive integer, so AC8 requires 400 —
+		// it must NOT be treated as an omitted parameter and silently defaulted.
+		recZero := getTransactions(t, env, customerID, "pageSize=0")
+		if recZero.Code != http.StatusBadRequest {
+			t.Fatalf("explicit zero pageSize: status = %d, want %d, body = %s", recZero.Code, http.StatusBadRequest, recZero.Body.String())
+		}
+
+		rec := getTransactions(t, env, customerID, "pageSize=-1")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("negative pageSize: status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		rec2 := getTransactions(t, env, customerID, "pageSize=abc")
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("non-numeric pageSize: status = %d, want %d, body = %s", rec2.Code, http.StatusBadRequest, rec2.Body.String())
+		}
+
+		rec3 := getTransactions(t, env, customerID, "pageSize=1000")
+		if rec3.Code != http.StatusOK {
+			t.Fatalf("oversized pageSize: status = %d, want %d, body = %s", rec3.Code, http.StatusOK, rec3.Body.String())
+		}
+		var body transactionsResponseBody
+		if err := json.Unmarshal(rec3.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(body.Transactions) > 100 {
+			t.Fatalf("transactions returned = %d, want clamped to at most 100", len(body.Transactions))
+		}
+	})
 }

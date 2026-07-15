@@ -1,0 +1,45 @@
+meta {
+  name: List Customer Transactions
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/customers/:id/transactions?pageSize=20
+  body: none
+  auth: inherit
+}
+
+params:query {
+  pageSize: 20
+  ~cursor: {{nextCursor}}
+}
+
+params:path {
+  id: {{customerId}}
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+
+  // Capture nextCursor so the next call can page forward: enable the disabled `cursor`
+  // query param above and it resolves to {{nextCursor}}. Empty once the last page is reached.
+  const body = res.getBody();
+  bru.setVar("nextCursor", (body && body.nextCursor) || "");
+}
+
+docs {
+  Lists a customer's transaction history, newest first, read generically from the
+  cause-tagged journal (Story 1.4). Set the environment's customerId var to an id
+  returned by Create Customer that has at least one transfer (see Create Transfer).
+
+  Pagination (keyset, opaque cursor):
+  - `pageSize` is optional: omit it for the default (20). It is clamped to a max of 100;
+    a value of 0, a negative value, or a non-numeric value is rejected with 400.
+  - `cursor` is disabled by default (first page). After a call, the response's
+    `nextCursor` is stored in the `nextCursor` var by the post-response script above —
+    enable the `cursor` query param to send it and fetch the next page. `nextCursor` is
+    absent from the response once the last page is reached.
+  - The cursor is signed and bound to this customer: a tampered cursor, or one issued for
+    a different customer, is rejected with 400 (never silently treated as the first page).
+}

@@ -1,5 +1,5 @@
 # generated: 2026-07-14
-# last_updated: 2026-07-15 (code-review: story 1-3 → done)
+# last_updated: 2026-07-15 (code-review: story 1-4 → done)
 # project: digital-asset-wallet-platform
 # project_key: NOKEY
 # tracking_system: file-system
@@ -52,7 +52,7 @@ development_status:
   1-1-create-customer-and-provision-per-asset-accounts: done
   1-2-query-customer-balances: done
   1-3-ledger-only-internal-transfer-between-customers: done
-  1-4-list-customer-transaction-history: backlog
+  1-4-list-customer-transaction-history: done
   1-5-generate-per-customer-deposit-address-via-create2-forwarder: backlog
   epic-1-retrospective: optional
 

@@ -14,15 +14,16 @@ import (
 // own beyond the use cases it delegates to — all persistence and transaction handling
 // happens through the core use cases and the ports they were constructed with.
 type customerServer struct {
-	createCustomer *core.CreateCustomer
-	getBalances    *core.GetCustomerBalances
-	createTransfer *core.CreateTransfer
+	createCustomer   *core.CreateCustomer
+	getBalances      *core.GetCustomerBalances
+	createTransfer   *core.CreateTransfer
+	listTransactions *core.ListCustomerTransactions
 }
 
 // NewServerInterface constructs the generated ServerInterface implementation. Later
 // stories add their own use cases here as this service grows.
-func NewServerInterface(createCustomer *core.CreateCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer) ServerInterface {
-	return &customerServer{createCustomer: createCustomer, getBalances: getBalances, createTransfer: createTransfer}
+func NewServerInterface(createCustomer *core.CreateCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer, listTransactions *core.ListCustomerTransactions) ServerInterface {
+	return &customerServer{createCustomer: createCustomer, getBalances: getBalances, createTransfer: createTransfer, listTransactions: listTransactions}
 }
 
 // CreateCustomer implements ServerInterface.CreateCustomer (POST /v1/customers).

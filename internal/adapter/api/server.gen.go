@@ -10,6 +10,7 @@ import (
 	"compress/flate"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -62,6 +63,42 @@ func (e BalanceChain) Valid() bool {
 	}
 }
 
+// Defines values for TransactionAsset.
+const (
+	TransactionAssetEth  TransactionAsset = "eth"
+	TransactionAssetUsdc TransactionAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the TransactionAsset enum.
+func (e TransactionAsset) Valid() bool {
+	switch e {
+	case TransactionAssetEth:
+		return true
+	case TransactionAssetUsdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TransactionChain.
+const (
+	TransactionChainArbitrum TransactionChain = "arbitrum"
+	TransactionChainBase     TransactionChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the TransactionChain enum.
+func (e TransactionChain) Valid() bool {
+	switch e {
+	case TransactionChainArbitrum:
+		return true
+	case TransactionChainBase:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TransferAsset.
 const (
 	TransferAssetEth  TransferAsset = "eth"
@@ -100,16 +137,16 @@ func (e TransferChain) Valid() bool {
 
 // Defines values for TransferRequestAsset.
 const (
-	Eth  TransferRequestAsset = "eth"
-	Usdc TransferRequestAsset = "usdc"
+	TransferRequestAssetEth  TransferRequestAsset = "eth"
+	TransferRequestAssetUsdc TransferRequestAsset = "usdc"
 )
 
 // Valid indicates whether the value is a known member of the TransferRequestAsset enum.
 func (e TransferRequestAsset) Valid() bool {
 	switch e {
-	case Eth:
+	case TransferRequestAssetEth:
 		return true
-	case Usdc:
+	case TransferRequestAssetUsdc:
 		return true
 	default:
 		return false
@@ -118,16 +155,16 @@ func (e TransferRequestAsset) Valid() bool {
 
 // Defines values for TransferRequestChain.
 const (
-	Arbitrum TransferRequestChain = "arbitrum"
-	Base     TransferRequestChain = "base"
+	TransferRequestChainArbitrum TransferRequestChain = "arbitrum"
+	TransferRequestChainBase     TransferRequestChain = "base"
 )
 
 // Valid indicates whether the value is a known member of the TransferRequestChain enum.
 func (e TransferRequestChain) Valid() bool {
 	switch e {
-	case Arbitrum:
+	case TransferRequestChainArbitrum:
 		return true
-	case Base:
+	case TransferRequestChainBase:
 		return true
 	default:
 		return false
@@ -167,6 +204,33 @@ type ProblemDetails struct {
 	Status   int     `json:"status"`
 	Title    string  `json:"title"`
 	Type     string  `json:"type"`
+}
+
+// Transaction defines model for Transaction.
+type Transaction struct {
+	// Amount Integer base units (wei for ETH, 6-decimal units for USDC), encoded as a string — never a JSON number. Signed from this customer's own perspective: negative when debited, positive when credited.
+	Amount    string             `json:"amount"`
+	Asset     TransactionAsset   `json:"asset"`
+	Chain     TransactionChain   `json:"chain"`
+	CreatedAt time.Time          `json:"createdAt"`
+	Id        openapi_types.UUID `json:"id"`
+	Status    string             `json:"status"`
+
+	// Type The journal entry's cause type, verbatim (e.g. "internal_transfer").
+	Type string `json:"type"`
+}
+
+// TransactionAsset defines model for Transaction.Asset.
+type TransactionAsset string
+
+// TransactionChain defines model for Transaction.Chain.
+type TransactionChain string
+
+// TransactionsResponse defines model for TransactionsResponse.
+type TransactionsResponse struct {
+	// NextCursor Opaque page marker for the next page. Absent when this is the last page.
+	NextCursor   *string       `json:"nextCursor,omitempty"`
+	Transactions []Transaction `json:"transactions"`
 }
 
 // Transfer defines model for Transfer.
@@ -213,6 +277,15 @@ type CreateCustomerParams struct {
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
 }
 
+// ListCustomerTransactionsParams defines parameters for ListCustomerTransactions.
+type ListCustomerTransactionsParams struct {
+	// Cursor Opaque page marker returned as nextCursor by a previous call. Omit for the first page.
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+
+	// PageSize Maximum number of transactions to return. Defaults to 20; values above 100 are clamped to 100.
+	PageSize *int `form:"pageSize,omitempty" json:"pageSize,omitempty"`
+}
+
 // CreateTransferParams defines parameters for CreateTransfer.
 type CreateTransferParams struct {
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
@@ -229,6 +302,9 @@ type ServerInterface interface {
 	// Query a customer's current balance for each supported asset and chain
 	// (GET /customers/{id}/balances)
 	GetCustomerBalances(w http.ResponseWriter, r *http.Request, id openapi_types.UUID)
+	// List a customer's transaction history, newest first
+	// (GET /customers/{id}/transactions)
+	ListCustomerTransactions(w http.ResponseWriter, r *http.Request, id openapi_types.UUID, params ListCustomerTransactionsParams)
 	// Move balance from one customer to another, ledger-only, no chain interaction
 	// (POST /transfers)
 	CreateTransfer(w http.ResponseWriter, r *http.Request, params CreateTransferParams)
@@ -317,6 +393,67 @@ func (siw *ServerInterfaceWrapper) GetCustomerBalances(w http.ResponseWriter, r 
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetCustomerBalances(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListCustomerTransactions operation middleware
+func (siw *ServerInterfaceWrapper) ListCustomerTransactions(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id openapi_types.UUID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid"})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListCustomerTransactionsParams
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "pageSize" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "pageSize", r.URL.Query(), &params.PageSize, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "pageSize"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "pageSize", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListCustomerTransactions(w, r, id, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -499,6 +636,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/customers", wrapper.CreateCustomer)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/balances", wrapper.GetCustomerBalances)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/transactions", wrapper.ListCustomerTransactions)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/transfers", wrapper.CreateTransfer)
 
 	return m
@@ -509,34 +647,43 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
-	"EgAA//8=",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

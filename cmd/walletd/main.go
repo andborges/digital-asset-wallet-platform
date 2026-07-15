@@ -67,6 +67,10 @@ func runAPI(logger *slog.Logger) error {
 		listenAddr = ":8080"
 	}
 	validTokens := splitNonEmpty(os.Getenv("API_BEARER_TOKENS"), ",")
+	cursorSigningKey := []byte(os.Getenv("API_CURSOR_SIGNING_KEY"))
+	if len(cursorSigningKey) == 0 {
+		return fmt.Errorf("API_CURSOR_SIGNING_KEY is required")
+	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -88,8 +92,10 @@ func runAPI(logger *slog.Logger) error {
 	getBalances := core.NewGetCustomerBalances(balanceRepo)
 	transferRepo := postgres.NewTransferRepository()
 	createTransfer := core.NewCreateTransfer(transferRepo)
+	transactionRepo := postgres.NewTransactionRepository(pool, cursorSigningKey)
+	listTransactions := core.NewListCustomerTransactions(transactionRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer, listTransactions)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,

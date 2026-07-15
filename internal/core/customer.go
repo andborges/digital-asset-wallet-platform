@@ -30,6 +30,15 @@ var ErrInsufficientBalance = errors.New("source account balance is less than the
 // IdempotencyMiddleware's own dedup.
 var ErrDuplicateTransferCause = errors.New("a journal entry already exists for this idempotency key")
 
+// ErrInvalidCursor is returned by TransactionRepository.ListCustomerTransactions when a
+// non-empty cursor does not decode to a valid page marker (tampered, truncated, or
+// otherwise malformed).
+var ErrInvalidCursor = errors.New("cursor is not a valid page marker")
+
+// ErrInvalidPageSize is returned by ListCustomerTransactions.Execute when pageSize is
+// negative — zero is treated as "omitted" (substituted with a default), never an error.
+var ErrInvalidPageSize = errors.New("page size must be a positive integer")
+
 // Chain identifies a supported EVM chain.
 type Chain string
 
@@ -100,4 +109,27 @@ type Transfer struct {
 	Asset                 Asset
 	Amount                *big.Int
 	CreatedAt             time.Time
+}
+
+// Transaction is one entry in a customer's transaction history (FR3) — one row per
+// (journal entry, this customer's own posting on it). Read generically from the
+// cause-tagged journal: Type is the journal entry's cause_type verbatim, and Amount is
+// this customer's own posting amount, signed (negative when debited, positive when
+// credited) — never the transfer's unsigned magnitude.
+type Transaction struct {
+	// ID is the journal entry's id.
+	ID        string
+	Type      string
+	Amount    *big.Int
+	Chain     Chain
+	Asset     Asset
+	Status    string
+	CreatedAt time.Time
+}
+
+// TransactionPage is one page of a customer's transaction history, newest first.
+// NextCursor is "" when there is no further page.
+type TransactionPage struct {
+	Transactions []Transaction
+	NextCursor   string
 }

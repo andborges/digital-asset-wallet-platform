@@ -32,8 +32,5 @@ up: ## Start Postgres in Docker (the only container used for local dev)
 down: ## Stop and remove the local Postgres container
 	docker compose -f deploy/compose/docker-compose.yml down
 
-swagger: ## Start Swagger UI in Docker, serving api/openapi.yaml on :8081
-	docker compose -f deploy/compose/docker-compose.yml up -d swagger-ui
-
 run: env ## Run the API locally against the Dockerized Postgres (loads .env)
 	set -a && . ./.env && set +a && go run ./cmd/walletd api

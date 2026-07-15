@@ -41,6 +41,21 @@ type TransferRepository interface {
 	CreateTransfer(ctx context.Context, req TransferRequest) (Transfer, error)
 }
 
+// TransactionRepository reads a customer's transaction history generically from the
+// cause-tagged journal (journal_entries joined to postings, restricted to this
+// customer's own accounts) — never filtered or switched on cause_type, so future cause
+// types appear automatically with no repository changes (FR3). Like BalanceRepository,
+// implementations query independently of any transaction on ctx: this is a plain read
+// with no state change to commit, and the idempotency middleware never opens a
+// transaction for the non-mutating GET route this port serves.
+type TransactionRepository interface {
+	// ListCustomerTransactions returns one page of customerID's transaction history,
+	// newest first. cursor == "" means "first page." Returns ErrCustomerNotFound if no
+	// such customer exists, or ErrInvalidCursor if cursor is non-empty but doesn't
+	// decode to a valid page marker.
+	ListCustomerTransactions(ctx context.Context, customerID string, pageSize int, cursor string) (TransactionPage, error)
+}
+
 // Tx, TxBeginner, and IdempotencyStore below are cross-cutting architectural ports
 // (AD-4's one-transaction-per-state-change rule, AD-5's idempotency-by-constraint rule)
 // rather than ledger domain concepts. They live in core, not in internal/adapter/api,

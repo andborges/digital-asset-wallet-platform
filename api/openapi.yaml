@@ -157,6 +157,66 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
+  /customers/{id}/transactions:
+    get:
+      operationId: listCustomerTransactions
+      summary: List a customer's transaction history, newest first
+      description: >
+        Reads generically from the cause-tagged journal (journal_entries joined to
+        postings, restricted to this customer's own accounts) — no cause_type filter
+        anywhere, so future cause types (deposit, withdrawal) appear automatically with
+        no endpoint changes. amount is signed from this customer's own perspective:
+        negative when debited, positive when credited.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque page marker returned as nextCursor by a previous call. Omit for the first page.
+          schema:
+            type: string
+        - name: pageSize
+          in: query
+          required: false
+          description: Maximum number of transactions to return. Defaults to 20; values above 100 are clamped to 100.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: One page of the customer's transaction history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionsResponse"
+        "400":
+          description: cursor does not decode to a valid page marker, or pageSize is present but not a positive integer
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: No customer with the given id exists
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "500":
+          description: Unexpected server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
 components:
   securitySchemes:
     bearerAuth:
@@ -267,6 +327,53 @@ components:
         createdAt:
           type: string
           format: date-time
+    Transaction:
+      type: object
+      required:
+        - id
+        - type
+        - amount
+        - chain
+        - asset
+        - status
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          description: >
+            The journal entry's cause type, verbatim (e.g. "internal_transfer").
+        amount:
+          type: string
+          description: >
+            Integer base units (wei for ETH, 6-decimal units for USDC), encoded as a
+            string — never a JSON number. Signed from this customer's own perspective:
+            negative when debited, positive when credited.
+        chain:
+          type: string
+          enum: [base, arbitrum]
+        asset:
+          type: string
+          enum: [eth, usdc]
+        status:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    TransactionsResponse:
+      type: object
+      required:
+        - transactions
+      properties:
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transaction"
+        nextCursor:
+          type: string
+          description: Opaque page marker for the next page. Absent when this is the last page.
     # RFC 9457 (application/problem+json). Every error response from this service
     # uses this shape, starting this story — see internal/adapter/api/problem.go.
     ProblemDetails:
