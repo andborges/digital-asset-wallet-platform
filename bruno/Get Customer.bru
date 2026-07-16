@@ -1,0 +1,26 @@
+meta {
+  name: Get Customer
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/customers/:id
+  body: none
+  auth: inherit
+}
+
+params:path {
+  id: {{customerId}}
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+}
+
+docs {
+  Set the environment's customerId var to an id returned by Create Customer.
+  Returns the customer's own attributes, including its deposit address
+  (depositAddress) — the CREATE2 counterfactual address, identical on every
+  supported EVM chain (FR7, AD-8).
+}
