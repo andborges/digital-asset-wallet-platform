@@ -19,9 +19,11 @@ func NewCustomerRepository() *CustomerRepository {
 	return &CustomerRepository{}
 }
 
-// CreateCustomer inserts customer and all of accounts using the single transaction
-// on ctx — one round-trip's worth of statements, one commit, per AD-4.
-func (r *CustomerRepository) CreateCustomer(ctx context.Context, customer core.Customer, accounts []core.Account) error {
+// CreateCustomer inserts customer, all of accounts, and its deposit address using the
+// single transaction on ctx — one round-trip's worth of statements, one commit, per
+// AD-4. depositAddress is already computed by the caller (core.CreateCustomer); this
+// repository only persists it.
+func (r *CustomerRepository) CreateCustomer(ctx context.Context, customer core.Customer, accounts []core.Account, depositAddress string) error {
 	tx := txFromContext(ctx)
 
 	if _, err := tx.Exec(ctx,
@@ -38,15 +40,19 @@ func (r *CustomerRepository) CreateCustomer(ctx context.Context, customer core.C
 			acc.ID, acc.CustomerID, string(acc.Chain), string(acc.Asset), acc.CreatedAt,
 		)
 	}
+	batch.Queue(
+		`INSERT INTO deposit_addresses (customer_id, address, created_at) VALUES ($1, $2, $3)`,
+		customer.ID, depositAddress, customer.CreatedAt,
+	)
 	br := tx.SendBatch(ctx, batch)
-	for range accounts {
+	for i := 0; i < len(accounts)+1; i++ {
 		if _, err := br.Exec(); err != nil {
 			_ = br.Close()
-			return fmt.Errorf("insert account: %w", err)
+			return fmt.Errorf("insert account or deposit address: %w", err)
 		}
 	}
 	if err := br.Close(); err != nil {
-		return fmt.Errorf("close account batch: %w", err)
+		return fmt.Errorf("close account/deposit-address batch: %w", err)
 	}
 
 	return nil

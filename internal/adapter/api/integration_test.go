@@ -24,6 +24,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	adapterapi "github.com/andborges/digital-asset-wallet-platform/internal/adapter/api"
+	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/evm"
 	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/postgres"
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
 )
@@ -75,7 +76,10 @@ func newTestHandler(t *testing.T) testEnv {
 	txBeginner := postgres.NewTxBeginner(pool)
 	idempotencyStore := postgres.NewIdempotencyStore(pool)
 	customerRepo := postgres.NewCustomerRepository()
-	createCustomer := core.NewCreateCustomer(customerRepo)
+	addressDeriver := evm.NewDepositAddressDeriver()
+	createCustomer := core.NewCreateCustomer(customerRepo, addressDeriver)
+	customerReader := postgres.NewCustomerReader(pool)
+	getCustomer := core.NewGetCustomer(customerReader)
 	balanceRepo := postgres.NewBalanceRepository(pool)
 	getBalances := core.NewGetCustomerBalances(balanceRepo)
 	transferRepo := postgres.NewTransferRepository()
@@ -83,7 +87,7 @@ func newTestHandler(t *testing.T) testEnv {
 	transactionRepo := postgres.NewTransactionRepository(pool, []byte("test-cursor-signing-key"))
 	listTransactions := core.NewListCustomerTransactions(transactionRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer, listTransactions)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
@@ -166,6 +170,22 @@ func createTestCustomer(t *testing.T, env testEnv, idempotencyKey string) string
 		t.Fatalf("decode create-customer response: %v", err)
 	}
 	return body.ID
+}
+
+// assertWellFormedDepositAddress fails the test unless addr is a well-formed,
+// EIP-55-checksummed 20-byte hex address. The check is delegated to
+// evm.IsChecksummedAddress so this test — a composition root, like cmd/walletd/main.go —
+// never imports go-ethereum directly; the dependency stays confined to internal/adapter/evm
+// (AD-1). It is a stronger check than a regex: it fails on wrong length, non-hex
+// characters, AND a wrong checksum.
+func assertWellFormedDepositAddress(t *testing.T, addr string) {
+	t.Helper()
+	if addr == "" {
+		t.Fatal("expected a non-empty depositAddress")
+	}
+	if !evm.IsChecksummedAddress(addr) {
+		t.Fatalf("depositAddress %q is not a well-formed EIP-55 checksummed address", addr)
+	}
 }
 
 func TestGetCustomerBalances_EndToEnd(t *testing.T) {
@@ -313,8 +333,9 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
 		}
 		var body struct {
-			ID        string    `json:"id"`
-			CreatedAt time.Time `json:"createdAt"`
+			ID             string    `json:"id"`
+			CreatedAt      time.Time `json:"createdAt"`
+			DepositAddress string    `json:"depositAddress"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode response: %v", err)
@@ -322,6 +343,7 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 		if body.ID == "" {
 			t.Fatal("expected a non-empty customer id")
 		}
+		assertWellFormedDepositAddress(t, body.DepositAddress)
 
 		// AC4: verify directly against Postgres — not just the HTTP response — that the
 		// customer and all four accounts exist as a single fait accompli, one insert
@@ -368,6 +390,45 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 		}
 		if balanceColumnExists {
 			t.Fatal("accounts table must not have a balance column (AD-3: balances are derived from postings)")
+		}
+	})
+
+	t.Run("Story 1.5 AC1: deposit address is computed once and persisted atomically with the customer", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer test-token")
+		req.Header.Set("Idempotency-Key", "e2e-deposit-address-key-1")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+		}
+		var body struct {
+			ID             string `json:"id"`
+			DepositAddress string `json:"depositAddress"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		assertWellFormedDepositAddress(t, body.DepositAddress)
+
+		// AD-4: the deposit address lands in the same transaction as the customer and
+		// account rows — verify directly against Postgres that exactly one row exists,
+		// matching the address the API returned.
+		ctx := context.Background()
+		var count int
+		var storedAddress string
+		if err := env.pool.QueryRow(ctx,
+			`SELECT count(*), max(address) FROM deposit_addresses WHERE customer_id = $1`,
+			body.ID,
+		).Scan(&count, &storedAddress); err != nil {
+			t.Fatalf("query deposit_addresses: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("deposit_addresses row count = %d, want exactly 1", count)
+		}
+		if storedAddress != body.DepositAddress {
+			t.Fatalf("stored address = %q, want %q (must match what CreateCustomer returned)", storedAddress, body.DepositAddress)
 		}
 	})
 
@@ -423,6 +484,86 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 		req.Header.Set("Idempotency-Key", "e2e-key-3")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+}
+
+// getCustomer issues a GET /v1/customers/{id} request and returns the recorded response.
+func getCustomer(t *testing.T, env testEnv, customerID string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID, nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestGetCustomer_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("AC2: response includes the deposit address as an attribute of the customer resource", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "get-customer-e2e-key-1")
+
+		rec := getCustomer(t, env, customerID)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body struct {
+			ID             string    `json:"id"`
+			CreatedAt      time.Time `json:"createdAt"`
+			DepositAddress string    `json:"depositAddress"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if body.ID != customerID {
+			t.Fatalf("id = %q, want %q", body.ID, customerID)
+		}
+		assertWellFormedDepositAddress(t, body.DepositAddress)
+	})
+
+	t.Run("AC4: repeated requests return the exact same stored address, never re-derived", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "get-customer-e2e-key-2")
+
+		first := getCustomer(t, env, customerID)
+		if first.Code != http.StatusOK {
+			t.Fatalf("first request status = %d, want %d, body = %s", first.Code, http.StatusOK, first.Body.String())
+		}
+		second := getCustomer(t, env, customerID)
+		if second.Code != http.StatusOK {
+			t.Fatalf("second request status = %d, want %d, body = %s", second.Code, http.StatusOK, second.Body.String())
+		}
+
+		var firstBody, secondBody struct {
+			DepositAddress string `json:"depositAddress"`
+		}
+		if err := json.Unmarshal(first.Body.Bytes(), &firstBody); err != nil {
+			t.Fatalf("decode first response: %v", err)
+		}
+		if err := json.Unmarshal(second.Body.Bytes(), &secondBody); err != nil {
+			t.Fatalf("decode second response: %v", err)
+		}
+		if firstBody.DepositAddress != secondBody.DepositAddress {
+			t.Fatalf("address changed across requests: %q != %q (must be read from storage, never re-derived)", firstBody.DepositAddress, secondBody.DepositAddress)
+		}
+	})
+
+	t.Run("unknown customer id returns 404", func(t *testing.T) {
+		unknownID := uuid.New().String()
+		rec := getCustomer(t, env, unknownID)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+	})
+
+	t.Run("missing bearer token is rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "get-customer-e2e-key-3")
+		req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID, nil)
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)

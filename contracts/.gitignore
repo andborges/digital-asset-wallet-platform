@@ -1,0 +1,7 @@
+# Compiler cache and build artifacts — regenerate via `forge build`.
+cache/
+out/
+
+# Foundry broadcast/deployment logs — none of this story's tests deploy for real, but
+# keep them out of version control if a future story adds a deploy script.
+broadcast/

@@ -117,6 +117,45 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
+  /customers/{id}:
+    get:
+      operationId: getCustomer
+      summary: Get a customer's own attributes, including its deposit address
+      description: >
+        Includes the customer's deposit address as an attribute of the customer
+        resource (FR7) — never a route parameter of its own.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Customer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: No customer with the given id exists
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "500":
+          description: Unexpected server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
   /customers/{id}/balances:
     get:
       operationId: getCustomerBalances
@@ -235,6 +274,7 @@ components:
       required:
         - id
         - createdAt
+        - depositAddress
       properties:
         id:
           type: string
@@ -242,6 +282,15 @@ components:
         createdAt:
           type: string
           format: date-time
+        depositAddress:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{40}$'
+          minLength: 42
+          maxLength: 42
+          description: >
+            The customer's counterfactual CREATE2 deposit address (FR6, FR7, AD-8) —
+            identical on every supported EVM chain. Computed once at customer creation
+            and persisted; never re-derived on request.
     Balance:
       type: object
       required:

@@ -1,4 +1,4 @@
-.PHONY: help build vet fmt fmt-check lint test test-unit up down swagger-ui env run
+.PHONY: help build vet fmt fmt-check lint test test-unit up down swagger-ui env run contracts-build contracts-test
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -34,3 +34,9 @@ down: ## Stop and remove the local Postgres container
 
 run: env ## Run the API locally against the Dockerized Postgres (loads .env)
 	set -a && . ./.env && set +a && go run ./cmd/walletd api
+
+contracts-build: ## Compile the Foundry contracts project (factory + forwarder)
+	cd contracts && forge build
+
+contracts-test: ## Run the Foundry test suite (cross-language CREATE2 vectors, AC5)
+	cd contracts && forge test

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	adapterapi "github.com/andborges/digital-asset-wallet-platform/internal/adapter/api"
+	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/evm"
 	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/postgres"
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
 )
@@ -31,6 +33,12 @@ const (
 	writeTimeout        = 30 * time.Second
 	idleTimeout         = 60 * time.Second
 	shutdownGracePeriod = 20 * time.Second
+	// deployerCheckTimeout bounds the startup canonical-deployer RPC probe per chain.
+	// ethclient dials lazily over HTTP, so without a deadline the eth_getCode call inherits
+	// the deadline-less root context and a black-holed/stalled RPC endpoint would hang
+	// startup forever — the opposite of AC3's "fail loudly". This turns a stall into a
+	// timeout error that trips the os.Exit(1) path.
+	deployerCheckTimeout = 10 * time.Second
 )
 
 func main() {
@@ -71,6 +79,46 @@ func runAPI(logger *slog.Logger) error {
 	if len(cursorSigningKey) == 0 {
 		return fmt.Errorf("API_CURSOR_SIGNING_KEY is required")
 	}
+	baseRPCURL := os.Getenv("BASE_RPC_URL")
+	if baseRPCURL == "" {
+		return fmt.Errorf("BASE_RPC_URL is required")
+	}
+	arbitrumRPCURL := os.Getenv("ARBITRUM_RPC_URL")
+	if arbitrumRPCURL == "" {
+		return fmt.Errorf("ARBITRUM_RPC_URL is required")
+	}
+	// Expected chain IDs are operator-configured, not hardcoded: the same binary runs
+	// against Sepolia testnets, mainnets, and local anvil (31337). The startup probe
+	// verifies each RPC endpoint actually reports its expected id — without this, a
+	// swapped or mis-pasted RPC URL passes the deployer-presence check silently, since
+	// the canonical deployer is live on most EVM chains (re-review 2026-07-16).
+	baseChainID, err := requiredChainIDEnv("BASE_CHAIN_ID")
+	if err != nil {
+		return err
+	}
+	arbitrumChainID, err := requiredChainIDEnv("ARBITRUM_CHAIN_ID")
+	if err != nil {
+		return err
+	}
+	chains := []evm.Chain{
+		{Name: "base", RPCURL: baseRPCURL, ChainID: baseChainID},
+		{Name: "arbitrum", RPCURL: arbitrumRPCURL, ChainID: arbitrumChainID},
+	}
+
+	// AC3: verify the canonical CREATE2 deployer is present on every configured chain
+	// before serving anything — fail startup loudly rather than risk deriving or
+	// verifying deposit addresses against a chain where CREATE2 addresses could diverge.
+	// Each probe is bounded by deployerCheckTimeout so an unreachable/stalled RPC endpoint
+	// surfaces as a timeout error instead of hanging startup indefinitely.
+	for _, chain := range chains {
+		if err := func() error {
+			checkCtx, cancel := context.WithTimeout(ctx, deployerCheckTimeout)
+			defer cancel()
+			return evm.VerifyDeployerPresence(checkCtx, chain)
+		}(); err != nil {
+			return fmt.Errorf("verify canonical CREATE2 deployer presence: %w", err)
+		}
+	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -87,7 +135,10 @@ func runAPI(logger *slog.Logger) error {
 	txBeginner := postgres.NewTxBeginner(pool)
 	idempotencyStore := postgres.NewIdempotencyStore(pool)
 	customerRepo := postgres.NewCustomerRepository()
-	createCustomer := core.NewCreateCustomer(customerRepo)
+	addressDeriver := evm.NewDepositAddressDeriver()
+	createCustomer := core.NewCreateCustomer(customerRepo, addressDeriver)
+	customerReader := postgres.NewCustomerReader(pool)
+	getCustomer := core.NewGetCustomer(customerReader)
 	balanceRepo := postgres.NewBalanceRepository(pool)
 	getBalances := core.NewGetCustomerBalances(balanceRepo)
 	transferRepo := postgres.NewTransferRepository()
@@ -95,7 +146,7 @@ func runAPI(logger *slog.Logger) error {
 	transactionRepo := postgres.NewTransactionRepository(pool, cursorSigningKey)
 	listTransactions := core.NewListCustomerTransactions(transactionRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getBalances, createTransfer, listTransactions)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
@@ -140,6 +191,20 @@ func runAPI(logger *slog.Logger) error {
 		logger.Info("walletd api stopped cleanly")
 		return nil
 	}
+}
+
+// requiredChainIDEnv reads a required EIP-155 chain id from the environment as a
+// positive decimal integer.
+func requiredChainIDEnv(name string) (uint64, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0, fmt.Errorf("%s is required", name)
+	}
+	id, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || id == 0 {
+		return 0, fmt.Errorf("%s must be a positive decimal EIP-155 chain id, got %q", name, v)
+	}
+	return id, nil
 }
 
 func splitNonEmpty(s, sep string) []string {

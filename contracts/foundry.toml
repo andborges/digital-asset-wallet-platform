@@ -1,0 +1,31 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+# Pinned to match the architecture spine's Stack table (verified 2026-07-14): Solidity
+# 0.8.36. Forced explicitly because plain auto-detection didn't resolve/install it
+# (confirmed working via `forge build --use 0.8.36`) — pinning here makes plain `forge
+# build`/`forge test` work the same way in CI and locally.
+solc_version = "0.8.36"
+
+# Reproducibility pinning (Story 1.5 code-review rework). The Forwarder/Factory init-code
+# hashes are hardcoded in internal/adapter/evm/address.go and every deposit address is
+# derived from them (AD-8), so the compiled creation bytecode MUST be byte-stable across
+# machines and over time.
+#   - bytecode_hash = "none": the default "ipfs" appends a CBOR metadata trailer to the
+#     creation code that hashes source content, comments, and file paths — an innocuous
+#     comment edit or a moved file would silently change the init-code hash (and thus every
+#     address). "none" strips that trailer entirely.
+#   - optimizer / optimizer_runs pinned explicitly: relying on the compiler default lets a
+#     differing default between a developer's Foundry and CI change the emitted bytecode.
+bytecode_hash = "none"
+optimizer = true
+optimizer_runs = 200
+#   - evm_version pinned explicitly (re-review 2026-07-16): Foundry's default EVM version
+#     changes across Foundry releases, so leaving it implicit lets a toolchain upgrade
+#     silently change the emitted bytecode the same way an unpinned optimizer would.
+#     "osaka" is what forge 1.7.1 resolves by default for solc 0.8.36 — i.e. the version
+#     the currently pinned init-code hashes were generated under.
+evm_version = "osaka"
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

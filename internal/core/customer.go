@@ -10,9 +10,12 @@ import (
 
 // Customer is a platform customer. Balances are never stored on Customer or Account —
 // they are always derived from postings (AD-3), starting this story's derivation query.
+// DepositAddress is computed once at customer creation (AD-8) and always required —
+// there is no "pending" state, since deriving it is pure math with no chain interaction.
 type Customer struct {
-	ID        string
-	CreatedAt time.Time
+	ID             string
+	CreatedAt      time.Time
+	DepositAddress string
 }
 
 // ErrCustomerNotFound is returned by BalanceRepository.CustomerBalances when no

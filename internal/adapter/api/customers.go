@@ -15,6 +15,7 @@ import (
 // happens through the core use cases and the ports they were constructed with.
 type customerServer struct {
 	createCustomer   *core.CreateCustomer
+	getCustomer      *core.GetCustomer
 	getBalances      *core.GetCustomerBalances
 	createTransfer   *core.CreateTransfer
 	listTransactions *core.ListCustomerTransactions
@@ -22,8 +23,8 @@ type customerServer struct {
 
 // NewServerInterface constructs the generated ServerInterface implementation. Later
 // stories add their own use cases here as this service grows.
-func NewServerInterface(createCustomer *core.CreateCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer, listTransactions *core.ListCustomerTransactions) ServerInterface {
-	return &customerServer{createCustomer: createCustomer, getBalances: getBalances, createTransfer: createTransfer, listTransactions: listTransactions}
+func NewServerInterface(createCustomer *core.CreateCustomer, getCustomer *core.GetCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer, listTransactions *core.ListCustomerTransactions) ServerInterface {
+	return &customerServer{createCustomer: createCustomer, getCustomer: getCustomer, getBalances: getBalances, createTransfer: createTransfer, listTransactions: listTransactions}
 }
 
 // CreateCustomer implements ServerInterface.CreateCustomer (POST /v1/customers).
@@ -49,8 +50,42 @@ func (s *customerServer) CreateCustomer(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(Customer{
-		Id:        id,
-		CreatedAt: customer.CreatedAt,
+		Id:             id,
+		CreatedAt:      customer.CreatedAt,
+		DepositAddress: customer.DepositAddress,
+	})
+}
+
+// GetCustomer implements ServerInterface.GetCustomer (GET /v1/customers/{id}). This
+// route is non-mutating, like GetCustomerBalances: IdempotencyMiddleware passes it
+// straight through without opening a transaction, so s.getCustomer reads independently
+// via its own port/pool, not r.Context()'s tx.
+func (s *customerServer) GetCustomer(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	customer, err := s.getCustomer.Execute(r.Context(), id.String())
+	if errors.Is(err, core.ErrCustomerNotFound) {
+		WriteProblem(w, http.StatusNotFound, "customer-not-found", err.Error(), r.URL.Path)
+		return
+	}
+	if err != nil {
+		WriteProblem(w, http.StatusInternalServerError, "get-customer-failed", err.Error(), r.URL.Path)
+		return
+	}
+
+	customerUUID, err := uuid.Parse(customer.ID)
+	if err != nil {
+		// core.Customer.ID is always a UUIDv7 string this service generated itself
+		// (core.newUUIDv7) — a parse failure here is a bug upstream, not bad external
+		// input, hence 500 (mirrors CreateCustomer's handling of its own generated ids).
+		WriteProblem(w, http.StatusInternalServerError, "invalid-customer-id", err.Error(), r.URL.Path)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(Customer{
+		Id:             customerUUID,
+		CreatedAt:      customer.CreatedAt,
+		DepositAddress: customer.DepositAddress,
 	})
 }
 

@@ -5,12 +5,39 @@ import (
 	"errors"
 )
 
-// CustomerRepository persists a customer and its accounts. Implementations must run
-// their writes against whatever transaction is already open on ctx (established by
-// the calling adapter's idempotency middleware) rather than opening their own —
-// this is what makes "customer + accounts, one transaction" (AD-4) true.
+// CustomerRepository persists a customer, its accounts, and its deposit address.
+// Implementations must run their writes against whatever transaction is already open on
+// ctx (established by the calling adapter's idempotency middleware) rather than opening
+// their own — this is what makes "customer + accounts + deposit address, one
+// transaction" (AD-4) true. depositAddress is customer.DepositAddress, already computed
+// by the time this is called — the repository persists it, it does not derive it.
 type CustomerRepository interface {
-	CreateCustomer(ctx context.Context, customer Customer, accounts []Account) error
+	CreateCustomer(ctx context.Context, customer Customer, accounts []Account, depositAddress string) error
+}
+
+// CustomerReader reads a customer's own attributes (id, creation time, deposit address),
+// unlike CustomerRepository which writes them. Like BalanceRepository/TransactionRepository,
+// implementations query independently of any transaction on ctx — GET /customers/{id} is
+// non-mutating, and IdempotencyMiddleware never opens a transaction for it.
+type CustomerReader interface {
+	// GetCustomer returns customerID's own record. Returns ErrCustomerNotFound if no such
+	// customer exists.
+	GetCustomer(ctx context.Context, customerID string) (Customer, error)
+}
+
+// DepositAddressDeriver computes a customer's CREATE2 deposit address from its salt
+// (AD-8). This is a port, not inline math in core, deliberately: the CREATE2 formula
+// (keccak256(0xff ++ factory ++ salt ++ initCodeHash)[12:]) is a correctness-critical
+// primitive where a single byte-order or padding bug would permanently corrupt every
+// customer address ever issued. Rather than reimplementing that formula by hand in core
+// with a second crypto library, this port is implemented in internal/adapter/evm using
+// go-ethereum's own crypto.CreateAddress2 — the same battle-tested helper the wider
+// Ethereum ecosystem relies on for this exact formula. This also keeps go-ethereum
+// imports and chain-ID references confined to internal/adapter/evm (AD-1) while keeping
+// core free of any adapter import (AD-1/AD-2) — the same shape as every other repository
+// port in this codebase, not a special case.
+type DepositAddressDeriver interface {
+	DeriveAddress(salt [32]byte) (string, error)
 }
 
 // BalanceRepository reads a customer's per-(chain, asset) balances, derived by summing
