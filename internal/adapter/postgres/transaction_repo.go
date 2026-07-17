@@ -35,6 +35,19 @@ func NewTransactionRepository(pool *pgxpool.Pool, cursorKey []byte) *Transaction
 	return &TransactionRepository{pool: pool, cursorKey: cursorKey}
 }
 
+// transactionStatus maps a journal entry's cause_type to the transaction history's
+// status string (Story 2.2): a "deposit_credit" cause type is shown as "credited" (AC4),
+// matching the deposit's own terminal state; every other cause type (e.g.
+// "internal_transfer") keeps the unconditional "completed" this endpoint always returned
+// before Story 2.2 — status is never switched on anything else, so a future cause type
+// defaults to "completed" with no repository change required.
+func transactionStatus(causeType string) string {
+	if causeType == depositCreditCauseType {
+		return "credited"
+	}
+	return "completed"
+}
+
 // cursorFieldSeparator joins the fields inside a cursor's payload. None of the fields can
 // contain it: customer/journal-entry/posting ids are UUIDs and created_at is RFC 3339
 // nanosecond text.
@@ -206,7 +219,7 @@ func (r *TransactionRepository) ListCustomerTransactions(ctx context.Context, cu
 				Amount:    amount,
 				Chain:     core.Chain(chain),
 				Asset:     core.Asset(asset),
-				Status:    "completed",
+				Status:    transactionStatus(causeType),
 				CreatedAt: createdAt,
 			},
 			postingID: postingID,

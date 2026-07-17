@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 )
 
 //go:embed migrations/*.sql
@@ -29,7 +30,17 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	sqlDB := stdlib.OpenDBFromPool(pool)
 	defer sqlDB.Close()
 
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, fsys)
+	// A session-scoped Postgres advisory lock serializes concurrent Migrate calls (re-review
+	// 2026-07-16): before Story 2.1, only one api process called this at boot; now the
+	// watcher role calls it too (once per configured chain), so a normal deploy or local
+	// `docker compose up` can start 3 processes that all call Migrate at roughly the same
+	// moment. Without a lock, concurrent unlocked `CREATE TABLE` statements race.
+	locker, err := lock.NewPostgresSessionLocker()
+	if err != nil {
+		return fmt.Errorf("create goose session locker: %w", err)
+	}
+
+	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, fsys, goose.WithSessionLocker(locker))
 	if err != nil {
 		return fmt.Errorf("create goose provider: %w", err)
 	}

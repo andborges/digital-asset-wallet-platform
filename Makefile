@@ -1,4 +1,4 @@
-.PHONY: help build vet fmt fmt-check lint test test-unit up down swagger-ui env run contracts-build contracts-test
+.PHONY: help build vet fmt fmt-check check-import-boundary lint test test-unit up down swagger-ui env run contracts-build contracts-test
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -15,7 +15,15 @@ fmt: ## Format all Go source files in place
 fmt-check: ## Fail if any Go file is not gofmt-formatted (CI-safe, no writes)
 	@test -z "$$(gofmt -l .)" || (echo "not gofmt-formatted:"; gofmt -l .; exit 1)
 
-lint: vet fmt-check ## vet + fmt-check together
+check-import-boundary: ## Fail if any .go file (including _test.go) outside internal/adapter/evm imports go-ethereum (AD-1)
+	@matches=$$(grep -rl 'github\.com/ethereum/go-ethereum' --include='*.go' . | grep -v '^\./internal/adapter/evm/'); \
+	if [ -n "$$matches" ]; then \
+		echo "go-ethereum imported outside internal/adapter/evm (AD-1 violation):"; \
+		echo "$$matches"; \
+		exit 1; \
+	fi
+
+lint: vet fmt-check check-import-boundary ## vet + fmt-check + check-import-boundary together
 
 test: ## Run the full suite, including the real-Postgres integration test (needs Docker)
 	go test ./...

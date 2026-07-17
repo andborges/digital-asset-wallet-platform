@@ -63,6 +63,81 @@ func (e BalanceChain) Valid() bool {
 	}
 }
 
+// Defines values for DepositAsset.
+const (
+	DepositAssetEth  DepositAsset = "eth"
+	DepositAssetUsdc DepositAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the DepositAsset enum.
+func (e DepositAsset) Valid() bool {
+	switch e {
+	case DepositAssetEth:
+		return true
+	case DepositAssetUsdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for DepositChain.
+const (
+	DepositChainArbitrum DepositChain = "arbitrum"
+	DepositChainBase     DepositChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the DepositChain enum.
+func (e DepositChain) Valid() bool {
+	switch e {
+	case DepositChainArbitrum:
+		return true
+	case DepositChainBase:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for DepositStatus.
+const (
+	DepositStatusOrphaned DepositStatus = "orphaned"
+	DepositStatusPending  DepositStatus = "pending"
+)
+
+// Valid indicates whether the value is a known member of the DepositStatus enum.
+func (e DepositStatus) Valid() bool {
+	switch e {
+	case DepositStatusOrphaned:
+		return true
+	case DepositStatusPending:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for DepositTier.
+const (
+	DepositTierObserved DepositTier = "observed"
+	DepositTierOrphaned DepositTier = "orphaned"
+	DepositTierSafe     DepositTier = "safe"
+)
+
+// Valid indicates whether the value is a known member of the DepositTier enum.
+func (e DepositTier) Valid() bool {
+	switch e {
+	case DepositTierObserved:
+		return true
+	case DepositTierOrphaned:
+		return true
+	case DepositTierSafe:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TransactionAsset.
 const (
 	TransactionAssetEth  TransactionAsset = "eth"
@@ -137,16 +212,16 @@ func (e TransferChain) Valid() bool {
 
 // Defines values for TransferRequestAsset.
 const (
-	TransferRequestAssetEth  TransferRequestAsset = "eth"
-	TransferRequestAssetUsdc TransferRequestAsset = "usdc"
+	Eth  TransferRequestAsset = "eth"
+	Usdc TransferRequestAsset = "usdc"
 )
 
 // Valid indicates whether the value is a known member of the TransferRequestAsset enum.
 func (e TransferRequestAsset) Valid() bool {
 	switch e {
-	case TransferRequestAssetEth:
+	case Eth:
 		return true
-	case TransferRequestAssetUsdc:
+	case Usdc:
 		return true
 	default:
 		return false
@@ -165,6 +240,24 @@ func (e TransferRequestChain) Valid() bool {
 	case TransferRequestChainArbitrum:
 		return true
 	case TransferRequestChainBase:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for UnsupportedTokenObservationChain.
+const (
+	UnsupportedTokenObservationChainArbitrum UnsupportedTokenObservationChain = "arbitrum"
+	UnsupportedTokenObservationChainBase     UnsupportedTokenObservationChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the UnsupportedTokenObservationChain enum.
+func (e UnsupportedTokenObservationChain) Valid() bool {
+	switch e {
+	case UnsupportedTokenObservationChainArbitrum:
+		return true
+	case UnsupportedTokenObservationChainBase:
 		return true
 	default:
 		return false
@@ -200,6 +293,42 @@ type Customer struct {
 	Id             openapi_types.UUID `json:"id"`
 }
 
+// Deposit defines model for Deposit.
+type Deposit struct {
+	// Amount Integer base units (wei for ETH, 6-decimal units for USDC), encoded as a string — never a JSON number — matching Balance's convention.
+	Amount     string             `json:"amount"`
+	Asset      DepositAsset       `json:"asset"`
+	Chain      DepositChain       `json:"chain"`
+	Id         openapi_types.UUID `json:"id"`
+	ObservedAt time.Time          `json:"observedAt"`
+
+	// Status "pending" for both the observed and safe tiers; "orphaned" once a reorg has evicted the deposit's block (Story 2.4) — Story 2.2's finalized/credited tiers are never surfaced on this endpoint (see tier).
+	Status DepositStatus `json:"status"`
+
+	// Tier This deposit's current position in the observed->safe->finalized->credited state machine (AD-6).
+	Tier DepositTier `json:"tier"`
+
+	// TxHash The on-chain transaction hash the deposit was observed in.
+	TxHash string `json:"txHash"`
+}
+
+// DepositAsset defines model for Deposit.Asset.
+type DepositAsset string
+
+// DepositChain defines model for Deposit.Chain.
+type DepositChain string
+
+// DepositStatus "pending" for both the observed and safe tiers; "orphaned" once a reorg has evicted the deposit's block (Story 2.4) — Story 2.2's finalized/credited tiers are never surfaced on this endpoint (see tier).
+type DepositStatus string
+
+// DepositTier This deposit's current position in the observed->safe->finalized->credited state machine (AD-6).
+type DepositTier string
+
+// DepositsResponse defines model for DepositsResponse.
+type DepositsResponse struct {
+	Deposits []Deposit `json:"deposits"`
+}
+
 // ProblemDetails defines model for ProblemDetails.
 type ProblemDetails struct {
 	Detail   *string `json:"detail,omitempty"`
@@ -217,7 +346,9 @@ type Transaction struct {
 	Chain     TransactionChain   `json:"chain"`
 	CreatedAt time.Time          `json:"createdAt"`
 	Id        openapi_types.UUID `json:"id"`
-	Status    string             `json:"status"`
+
+	// Status "completed" for most cause types (e.g. "internal_transfer"); "credited" for a "deposit_credit" cause type (Story 2.2), the same terminal state as the underlying deposit.
+	Status string `json:"status"`
 
 	// Type The journal entry's cause type, verbatim (e.g. "internal_transfer").
 	Type string `json:"type"`
@@ -269,6 +400,33 @@ type TransferRequestAsset string
 // TransferRequestChain defines model for TransferRequest.Chain.
 type TransferRequestChain string
 
+// UnsupportedTokenObservation defines model for UnsupportedTokenObservation.
+type UnsupportedTokenObservation struct {
+	// Amount The transfer's raw on-chain amount, in the unsupported token's own base units (decimals unknown to this platform) — encoded as a string, never a JSON number, matching Balance's convention.
+	Amount      string                           `json:"amount"`
+	BlockNumber int64                            `json:"blockNumber"`
+	Chain       UnsupportedTokenObservationChain `json:"chain"`
+
+	// ContractAddress The ERC-20 token contract address that emitted the Transfer log — not in token_registry at the time this was observed, hence "unsupported" (Story 2.3, FR11).
+	ContractAddress string `json:"contractAddress"`
+
+	// DepositAddress The known deposit address the unsupported transfer landed on.
+	DepositAddress string             `json:"depositAddress"`
+	Id             openapi_types.UUID `json:"id"`
+	ObservedAt     time.Time          `json:"observedAt"`
+
+	// TxHash The on-chain transaction hash the transfer was observed in.
+	TxHash string `json:"txHash"`
+}
+
+// UnsupportedTokenObservationChain defines model for UnsupportedTokenObservation.Chain.
+type UnsupportedTokenObservationChain string
+
+// UnsupportedTokenObservationsResponse defines model for UnsupportedTokenObservationsResponse.
+type UnsupportedTokenObservationsResponse struct {
+	Observations []UnsupportedTokenObservation `json:"observations"`
+}
+
 // IdempotencyKey defines model for IdempotencyKey.
 type IdempotencyKey = string
 
@@ -308,12 +466,18 @@ type ServerInterface interface {
 	// Query a customer's current balance for each supported asset and chain
 	// (GET /customers/{id}/balances)
 	GetCustomerBalances(w http.ResponseWriter, r *http.Request, id openapi_types.UUID)
+	// List a customer's pending deposits
+	// (GET /customers/{id}/deposits)
+	GetCustomerDeposits(w http.ResponseWriter, r *http.Request, id openapi_types.UUID)
 	// List a customer's transaction history, newest first
 	// (GET /customers/{id}/transactions)
 	ListCustomerTransactions(w http.ResponseWriter, r *http.Request, id openapi_types.UUID, params ListCustomerTransactionsParams)
 	// Move balance from one customer to another, ledger-only, no chain interaction
 	// (POST /transfers)
 	CreateTransfer(w http.ResponseWriter, r *http.Request, params CreateTransferParams)
+	// List every recorded unsupported-token observation, for manual operator triage
+	// (GET /unsupported-token-observations)
+	GetUnsupportedTokenObservations(w http.ResponseWriter, r *http.Request)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -440,6 +604,38 @@ func (siw *ServerInterfaceWrapper) GetCustomerBalances(w http.ResponseWriter, r 
 	handler.ServeHTTP(w, r)
 }
 
+// GetCustomerDeposits operation middleware
+func (siw *ServerInterfaceWrapper) GetCustomerDeposits(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id openapi_types.UUID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid"})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetCustomerDeposits(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListCustomerTransactions operation middleware
 func (siw *ServerInterfaceWrapper) ListCustomerTransactions(w http.ResponseWriter, r *http.Request) {
 
@@ -543,6 +739,26 @@ func (siw *ServerInterfaceWrapper) CreateTransfer(w http.ResponseWriter, r *http
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.CreateTransfer(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetUnsupportedTokenObservations operation middleware
+func (siw *ServerInterfaceWrapper) GetUnsupportedTokenObservations(w http.ResponseWriter, r *http.Request) {
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetUnsupportedTokenObservations(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -675,8 +891,10 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/customers", wrapper.CreateCustomer)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}", wrapper.GetCustomer)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/balances", wrapper.GetCustomerBalances)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/deposits", wrapper.GetCustomerDeposits)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/transactions", wrapper.ListCustomerTransactions)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/transfers", wrapper.CreateTransfer)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/unsupported-token-observations", wrapper.GetUnsupportedTokenObservations)
 
 	return m
 }
@@ -686,46 +904,62 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
+	"TfohvuK/vb75/wAAAP//",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

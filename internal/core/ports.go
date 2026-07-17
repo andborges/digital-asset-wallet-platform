@@ -83,6 +83,141 @@ type TransactionRepository interface {
 	ListCustomerTransactions(ctx context.Context, customerID string, pageSize int, cursor string) (TransactionPage, error)
 }
 
+// ChainScanner reads one configured chain's head/safe tags and scans its blocks for
+// ETH/ERC-20 transfers landing on known deposit addresses. Implemented in
+// internal/adapter/evm — all go-ethereum imports, RPC calls, and chain-ID references are
+// confined there (AD-1). One ChainScanner is bound to a single chain (one OS process per
+// chain, AD-2), which is why neither method takes a chain parameter.
+type ChainScanner interface {
+	// Head returns the chain's current head block, its current "safe" block (via
+	// eth_getBlockByNumber("safe", false)), and its current "finalized" block (via
+	// eth_getBlockByNumber("finalized", false), Story 2.2). Returns an error if the RPC
+	// endpoint does not support either tag — never a silent "head minus N blocks"
+	// approximation.
+	Head(ctx context.Context) (latest, safe, finalized uint64, err error)
+	// BlockHash returns the chain's CURRENT block hash at blockNumber (Story 2.4) — the
+	// value TrackDeposits.Execute's reorg-check phase compares against each pending
+	// deposit's stored block_hash. exists is false, with no error, when the chain no
+	// longer has a block at that height at all (the "chain got shorter than the
+	// deposit's height" case, Design Notes' I/O matrix) — this is a normal, expected
+	// outcome of a reorg, never a failed poll.
+	BlockHash(ctx context.Context, blockNumber uint64) (hash string, exists bool, err error)
+	// ScanDeposits scans the inclusive block range [fromBlock, toBlock] for ETH/ERC-20
+	// transfers landing on any address in knownAddresses. Native ETH transfers are found
+	// by scanning each block's transactions for tx.To() in knownAddresses (no log exists
+	// for a plain value transfer); ERC-20 transfers are found via a single, unfiltered-by-
+	// contract eth_getLogs Transfer topic filter (Story 2.3: filtering by contract address
+	// up front would filter unsupported transfers out before classification ever ran) and
+	// classified per log against tokenRegistry (keyed by lowercase contract address, Story
+	// 2.3's FR34 — a registry hit is an ordinary ObservedTransfer, a miss is an
+	// UnsupportedTokenObservation). The zero-amount guard applies to both branches.
+	ScanDeposits(ctx context.Context, knownAddresses []string, tokenRegistry map[string]Asset, fromBlock, toBlock uint64) ([]ObservedTransfer, []UnsupportedTokenObservation, error)
+}
+
+// DepositAddressLister lists every customer deposit address currently provisioned
+// (Story 1.5's deposit_addresses table) — the known-address set TrackDeposits scans
+// against. Reloaded every poll cycle (simple and correct; scaling this is not this
+// story's concern).
+type DepositAddressLister interface {
+	ListDepositAddresses(ctx context.Context) ([]string, error)
+}
+
+// TokenRegistryLister lists chain's configured ERC-20 token registry — the
+// (contract_address -> asset) snapshot ChainScanner.ScanDeposits classifies each Transfer
+// log against (Story 2.3, FR34). Scoped to chain (unlike DepositAddressLister's
+// platform-wide list, a token contract address genuinely differs per chain — the same
+// reasoning that made evm.Chain.USDCAddress chain-specific before this story). Reloaded
+// every poll cycle, the same "simple and correct" choice as DepositAddressLister. Keys
+// are lowercase-normalized hex contract addresses: Ethereum addresses are
+// case-insensitive at the byte level, but log addresses and stored strings can differ in
+// checksum casing, so both the write side (postgres.TokenRegistry.UpsertToken) and the
+// read side (evm.Scanner's lookup) must agree on one canonical case.
+type TokenRegistryLister interface {
+	ListTokenRegistry(ctx context.Context, chain Chain) (map[string]Asset, error)
+}
+
+// DepositRepository is the watcher's sole write path for deposits, cursors, and their
+// paired outbox events. Implementations must run every method's writes against whatever
+// transaction is already open on ctx (established by TrackDeposits via TxBeginner)
+// rather than opening their own, the same AD-4 contract as CustomerRepository.
+type DepositRepository interface {
+	// RecordObserved inserts deposit in the observed state and, only when a row was
+	// actually inserted, a paired "deposit.pending" outbox event — both in the caller's
+	// open transaction (AD-4). Re-observing the same (chain, tx_hash, log_index) on a
+	// repoll relies on the DB's UNIQUE constraint (INSERT ... ON CONFLICT DO NOTHING,
+	// AD-5), never an application-level existence check; inserted is false on that
+	// no-op path.
+	RecordObserved(ctx context.Context, deposit Deposit) (inserted bool, err error)
+	// PromoteToSafe transitions every observed deposit on chain whose block_number is
+	// at or below safeBlock to the safe state, in one bulk statement. Returns the
+	// number of rows transitioned.
+	PromoteToSafe(ctx context.Context, chain Chain, safeBlock uint64) (int, error)
+	// PromoteToFinalized transitions every safe deposit on chain whose block_number is
+	// at or below finalizedBlock to the finalized state, in one bulk statement (Story
+	// 2.2), mirroring PromoteToSafe exactly one tier up. Returns the number of rows
+	// transitioned.
+	PromoteToFinalized(ctx context.Context, chain Chain, finalizedBlock uint64) (int, error)
+	// CreditFinalizedDeposits credits every finalized deposit on chain whose
+	// (chain, asset) crediting policy is 'finalized' (Story 2.2, FR9): for each eligible
+	// row it writes one balanced journal entry (cause_type='deposit_credit',
+	// cause_id=deposit.id) debiting the chain/asset forwarder-float platform account and
+	// crediting the customer's own account, transitions the deposit to credited, and
+	// writes a paired "deposit.credited" outbox event — all in the caller's open
+	// transaction (AD-4). A deposit already credited is never re-selected (the query is
+	// scoped to state='finalized'), so this is naturally idempotent across repeated
+	// polls. Returns the number of deposits credited.
+	CreditFinalizedDeposits(ctx context.Context, chain Chain) (int, error)
+	// ListPendingDeposits returns every observed/safe deposit on chain (Story 2.4) —
+	// exactly the states TrackDeposits.Execute's reorg-check phase must re-verify each
+	// poll. finalized/credited deposits are never candidates for orphaning and are never
+	// returned here (this is what makes AC1's "no balance ever affected" true by
+	// construction, not a runtime guard).
+	ListPendingDeposits(ctx context.Context, chain Chain) ([]Deposit, error)
+	// OrphanDeposit transitions depositID to the orphaned state and writes a paired
+	// "deposit.orphaned" outbox event, both in the transaction already open on ctx
+	// (AD-4) — mirroring RecordObserved's paired-write pattern exactly.
+	OrphanDeposit(ctx context.Context, depositID string) error
+	// Cursor returns the last block persisted for (chain, tier) — "observed", "safe",
+	// or "finalized" — or 0 if no cursor has ever been set for that pair.
+	Cursor(ctx context.Context, chain Chain, tier string) (uint64, error)
+	// SetCursor persists the last block processed for (chain, tier).
+	SetCursor(ctx context.Context, chain Chain, tier string, block uint64) error
+}
+
+// DepositReader reads a customer's own deposits — observed and safe tiers count as
+// "pending" (Story 2.2 introduces finalized/credited, never surfaced here) and orphaned
+// deposits are surfaced as their own status (Story 2.4, AC1: a customer must be able to
+// see a deposit was reorged away, not have it silently vanish). Like BalanceRepository,
+// implementations query independently of any transaction on ctx: this serves a
+// non-mutating GET route, and IdempotencyMiddleware never opens a transaction for it.
+type DepositReader interface {
+	// ListCustomerDeposits returns customerID's deposits, resolved via a join against
+	// deposit_addresses (deposits has no customer_id column by design, AD-8). Returns
+	// ErrCustomerNotFound if no such customer exists.
+	ListCustomerDeposits(ctx context.Context, customerID string) ([]Deposit, error)
+}
+
+// UnsupportedTokenRepository is the watcher's write path for unsupported-token
+// observations (Story 2.3, FR11) and the operator-facing read path over them.
+// RecordObservation must run against whatever transaction is already open on ctx
+// (established by TrackDeposits via TxBeginner), mirroring DepositRepository's AD-4
+// contract exactly — an unsupported-token observation is recorded in the SAME
+// transaction as everything else that poll cycle. ListObservations is a plain read,
+// scoped to no customer (this is operator-facing and platform-wide, not customer-scoped),
+// so it queries independently of any transaction on ctx like DepositReader.
+type UnsupportedTokenRepository interface {
+	// RecordObservation inserts observation, relying entirely on the DB's UNIQUE
+	// (chain, tx_hash, log_index) constraint (INSERT ... ON CONFLICT DO NOTHING, AD-5) —
+	// never an application-level existence check — so a repoll of an already-recorded
+	// event is a no-op reported via inserted=false, never an error. Mirrors
+	// DepositRepository.RecordObserved's exact idempotency pattern.
+	RecordObservation(ctx context.Context, observation UnsupportedTokenObservation) (inserted bool, err error)
+	// ListObservations returns every recorded unsupported-token observation, newest
+	// first — a flat, platform-wide list for manual operator triage (AC3), never filtered
+	// or scoped to a customer.
+	ListObservations(ctx context.Context) ([]UnsupportedTokenObservation, error)
+}
+
 // Tx, TxBeginner, and IdempotencyStore below are cross-cutting architectural ports
 // (AD-4's one-transaction-per-state-change rule, AD-5's idempotency-by-constraint rule)
 // rather than ledger domain concepts. They live in core, not in internal/adapter/api,

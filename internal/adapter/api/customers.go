@@ -14,17 +14,27 @@ import (
 // own beyond the use cases it delegates to — all persistence and transaction handling
 // happens through the core use cases and the ports they were constructed with.
 type customerServer struct {
-	createCustomer   *core.CreateCustomer
-	getCustomer      *core.GetCustomer
-	getBalances      *core.GetCustomerBalances
-	createTransfer   *core.CreateTransfer
-	listTransactions *core.ListCustomerTransactions
+	createCustomer                   *core.CreateCustomer
+	getCustomer                      *core.GetCustomer
+	getBalances                      *core.GetCustomerBalances
+	createTransfer                   *core.CreateTransfer
+	listTransactions                 *core.ListCustomerTransactions
+	getDeposits                      *core.GetCustomerDeposits
+	listUnsupportedTokenObservations *core.ListUnsupportedTokenObservations
 }
 
 // NewServerInterface constructs the generated ServerInterface implementation. Later
 // stories add their own use cases here as this service grows.
-func NewServerInterface(createCustomer *core.CreateCustomer, getCustomer *core.GetCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer, listTransactions *core.ListCustomerTransactions) ServerInterface {
-	return &customerServer{createCustomer: createCustomer, getCustomer: getCustomer, getBalances: getBalances, createTransfer: createTransfer, listTransactions: listTransactions}
+func NewServerInterface(createCustomer *core.CreateCustomer, getCustomer *core.GetCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer, listTransactions *core.ListCustomerTransactions, getDeposits *core.GetCustomerDeposits, listUnsupportedTokenObservations *core.ListUnsupportedTokenObservations) ServerInterface {
+	return &customerServer{
+		createCustomer:                   createCustomer,
+		getCustomer:                      getCustomer,
+		getBalances:                      getBalances,
+		createTransfer:                   createTransfer,
+		listTransactions:                 listTransactions,
+		getDeposits:                      getDeposits,
+		listUnsupportedTokenObservations: listUnsupportedTokenObservations,
+	}
 }
 
 // CreateCustomer implements ServerInterface.CreateCustomer (POST /v1/customers).

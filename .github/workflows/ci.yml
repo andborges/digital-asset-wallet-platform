@@ -19,5 +19,4 @@ jobs:
       - run: make lint
       - run: make test
       - run: make contracts-test
-      # Story 2.1 adds an import-boundary check to this same job — do not create a
-      # second workflow file for it.
+      - run: make check-import-boundary

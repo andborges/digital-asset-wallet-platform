@@ -86,8 +86,12 @@ func newTestHandler(t *testing.T) testEnv {
 	createTransfer := core.NewCreateTransfer(transferRepo)
 	transactionRepo := postgres.NewTransactionRepository(pool, []byte("test-cursor-signing-key"))
 	listTransactions := core.NewListCustomerTransactions(transactionRepo)
+	depositReader := postgres.NewDepositReader(pool)
+	getDeposits := core.NewGetCustomerDeposits(depositReader)
+	unsupportedTokenRepo := postgres.NewUnsupportedTokenRepository(pool)
+	listUnsupportedTokenObservations := core.NewListUnsupportedTokenObservations(unsupportedTokenRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions, getDeposits, listUnsupportedTokenObservations)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
@@ -1092,6 +1096,716 @@ func TestListCustomerTransactions_EndToEnd(t *testing.T) {
 		}
 		if len(body.Transactions) > 100 {
 			t.Fatalf("transactions returned = %d, want clamped to at most 100", len(body.Transactions))
+		}
+	})
+}
+
+// depositsResponseBody decodes a GET .../deposits response body.
+type depositsResponseBody struct {
+	Deposits []struct {
+		ID         string    `json:"id"`
+		Chain      string    `json:"chain"`
+		Asset      string    `json:"asset"`
+		Amount     string    `json:"amount"`
+		TxHash     string    `json:"txHash"`
+		Status     string    `json:"status"`
+		Tier       string    `json:"tier"`
+		ObservedAt time.Time `json:"observedAt"`
+	} `json:"deposits"`
+}
+
+// getDeposits issues a GET /v1/customers/{id}/deposits request and returns the recorded
+// response.
+func getDeposits(t *testing.T, env testEnv, customerID string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID+"/deposits", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// dummyBlockHash is a well-formed (but arbitrary) block hash used to satisfy the
+// block_hash NOT NULL/CHECK constraint (migration 0008) in fixtures that don't care about
+// its actual value — only the reorg-specific tests below assert on block_hash directly.
+const dummyBlockHash = "0xd000000000000000000000000000000000000000000000000000000000000000"
+
+// seedDeposit inserts a deposits row directly via test SQL — no watcher runs in this
+// test, matching the story's instruction that TestGetCustomerDeposits_EndToEnd seeds the
+// deposits row directly. address must be an existing customer's own deposit address
+// (deposits has no customer_id column by design, AD-8; attribution is resolved at read
+// time via the deposit_addresses join).
+func seedDeposit(t *testing.T, env testEnv, address, chain, asset, txHash string, logIndex int, amount string, blockNumber uint64, state string) {
+	t.Helper()
+	seedDepositAt(t, env, address, chain, asset, txHash, logIndex, amount, blockNumber, state, time.Now().UTC())
+}
+
+// seedDepositAt is seedDeposit with an explicit observed_at, so a test can control
+// ordering between multiple seeded rows (re-review 2026-07-16) — seedDeposit's own
+// time.Now().UTC() call gives every row in the same test near-identical timestamps,
+// too close together to reliably assert an ORDER BY observed_at DESC result. Uses
+// dummyBlockHash (Story 2.4): callers that need to control block_hash directly (the
+// reorg-detection tests) use seedDepositWithHash instead.
+func seedDepositAt(t *testing.T, env testEnv, address, chain, asset, txHash string, logIndex int, amount string, blockNumber uint64, state string, observedAt time.Time) {
+	t.Helper()
+	seedDepositWithHash(t, env, address, chain, asset, txHash, logIndex, amount, blockNumber, dummyBlockHash, state, observedAt)
+}
+
+// seedDepositWithHash is seedDepositAt with an explicit block_hash (Story 2.4) — used by
+// the reorg-detection tests, which need to seed a deposit with a KNOWN stale hash to force
+// a mismatch against a fake/real chain's current hash at that height.
+func seedDepositWithHash(t *testing.T, env testEnv, address, chain, asset, txHash string, logIndex int, amount string, blockNumber uint64, blockHash, state string, observedAt time.Time) {
+	t.Helper()
+	if _, err := env.pool.Exec(context.Background(),
+		`INSERT INTO deposits (id, chain, asset, address, tx_hash, log_index, amount, block_number, block_hash, state, observed_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10, $11, $11)`,
+		uuid.New().String(), chain, asset, address, txHash, logIndex, amount, blockNumber, blockHash, state, observedAt,
+	); err != nil {
+		t.Fatalf("seed deposits fixture row: %v", err)
+	}
+}
+
+func TestGetCustomerDeposits_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("observed and safe deposits both appear with status pending and their own tier", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "deposits-e2e-key-1")
+
+		custRec := getCustomer(t, env, customerID)
+		if custRec.Code != http.StatusOK {
+			t.Fatalf("get customer status = %d, want %d, body = %s", custRec.Code, http.StatusOK, custRec.Body.String())
+		}
+		var custBody struct {
+			DepositAddress string `json:"depositAddress"`
+		}
+		if err := json.Unmarshal(custRec.Body.Bytes(), &custBody); err != nil {
+			t.Fatalf("decode customer response: %v", err)
+		}
+
+		seedDeposit(t, env, custBody.DepositAddress, "base", "eth", "0xobserved1", -1, "1000000000000000000", 50, "observed")
+		seedDeposit(t, env, custBody.DepositAddress, "base", "usdc", "0xsafe1", 3, "42000000", 10, "safe")
+
+		rec := getDeposits(t, env, customerID)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body depositsResponseBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(body.Deposits) != 2 {
+			t.Fatalf("deposits = %+v, want exactly 2", body.Deposits)
+		}
+
+		var gotObserved, gotSafe bool
+		for _, d := range body.Deposits {
+			if d.Status != "pending" {
+				t.Fatalf("deposit %+v status = %q, want %q (both observed and safe tiers are pending this story)", d, d.Status, "pending")
+			}
+			switch d.TxHash {
+			case "0xobserved1":
+				gotObserved = true
+				if d.Tier != "observed" || d.Chain != "base" || d.Asset != "eth" || d.Amount != "1000000000000000000" {
+					t.Fatalf("observed deposit = %+v, want tier=observed chain=base asset=eth amount=1000000000000000000", d)
+				}
+			case "0xsafe1":
+				gotSafe = true
+				if d.Tier != "safe" || d.Chain != "base" || d.Asset != "usdc" || d.Amount != "42000000" {
+					t.Fatalf("safe deposit = %+v, want tier=safe chain=base asset=usdc amount=42000000", d)
+				}
+			}
+		}
+		if !gotObserved || !gotSafe {
+			t.Fatalf("deposits = %+v, want both the observed and safe fixtures", body.Deposits)
+		}
+	})
+
+	t.Run("deposits are returned newest first (ORDER BY observed_at DESC)", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "deposits-e2e-key-order")
+
+		custRec := getCustomer(t, env, customerID)
+		var custBody struct {
+			DepositAddress string `json:"depositAddress"`
+		}
+		if err := json.Unmarshal(custRec.Body.Bytes(), &custBody); err != nil {
+			t.Fatalf("decode customer response: %v", err)
+		}
+
+		base := time.Now().UTC().Add(-1 * time.Hour)
+		seedDepositAt(t, env, custBody.DepositAddress, "base", "eth", "0xoldest", -1, "1", 10, "observed", base)
+		seedDepositAt(t, env, custBody.DepositAddress, "base", "eth", "0xmiddle", -1, "2", 20, "observed", base.Add(10*time.Minute))
+		seedDepositAt(t, env, custBody.DepositAddress, "base", "eth", "0xnewest", -1, "3", 30, "observed", base.Add(20*time.Minute))
+
+		rec := getDeposits(t, env, customerID)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body depositsResponseBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(body.Deposits) != 3 {
+			t.Fatalf("deposits = %+v, want exactly 3", body.Deposits)
+		}
+		wantOrder := []string{"0xnewest", "0xmiddle", "0xoldest"}
+		for i, want := range wantOrder {
+			if body.Deposits[i].TxHash != want {
+				t.Fatalf("deposits[%d].txHash = %q, want %q (newest first) — got order %v", i, body.Deposits[i].TxHash, want, body.Deposits)
+			}
+		}
+	})
+
+	t.Run("a customer with no deposits gets an empty list, not an error", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "deposits-e2e-key-2")
+
+		rec := getDeposits(t, env, customerID)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body depositsResponseBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(body.Deposits) != 0 {
+			t.Fatalf("deposits = %+v, want empty", body.Deposits)
+		}
+	})
+
+	t.Run("unknown customer id returns 404", func(t *testing.T) {
+		unknownID := uuid.New().String()
+		rec := getDeposits(t, env, unknownID)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+	})
+
+	t.Run("missing bearer token is rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "deposits-e2e-key-3")
+		req := httptest.NewRequest(http.MethodGet, "/v1/customers/"+customerID+"/deposits", nil)
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+}
+
+// customerDepositAddress fetches customerID's own deposit address via GET
+// /v1/customers/{id}, the same read path Story 1.5 exposes it through.
+func customerDepositAddress(t *testing.T, env testEnv, customerID string) string {
+	t.Helper()
+	rec := getCustomer(t, env, customerID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get customer status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body struct {
+		DepositAddress string `json:"depositAddress"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode customer response: %v", err)
+	}
+	return body.DepositAddress
+}
+
+// TestCreditFinalizedDeposits_EndToEnd exercises Story 2.2's crediting path directly
+// against real Postgres: postgres.NewDepositRepository().CreditFinalizedDeposits is
+// invoked against a transaction opened via the test env's own postgres.TxBeginner —
+// mirroring exactly how core.TrackDeposits.Execute calls it mid-poll — rather than
+// running the full watcher, since no ChainScanner/anvil interaction is needed to prove
+// the credit write path (the migration/deposit_repo/transaction_repo/balance path this
+// story actually changes).
+func TestCreditFinalizedDeposits_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+	ctx := context.Background()
+	txBeginner := postgres.NewTxBeginner(env.pool)
+	depositRepo := postgres.NewDepositRepository()
+
+	t.Run("AC1 & AC4: a finalized deposit is credited — journal entry, postings, outbox event, transaction history, and balance all reflect it", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "credit-e2e-key-1")
+		depositAddress := customerDepositAddress(t, env, customerID)
+
+		seedDeposit(t, env, depositAddress, "base", "eth", "0xfinalized1", -1, "2500000000000000000", 100, "finalized")
+
+		txCtx, tx, err := txBeginner.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin transaction: %v", err)
+		}
+		credited, err := depositRepo.CreditFinalizedDeposits(txCtx, core.ChainBase)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("CreditFinalizedDeposits() error = %v, want nil", err)
+		}
+		if credited != 1 {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("credited count = %d, want 1", credited)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit transaction: %v", err)
+		}
+
+		var depositID, state string
+		if err := env.pool.QueryRow(ctx, `SELECT id, state FROM deposits WHERE tx_hash = $1`, "0xfinalized1").Scan(&depositID, &state); err != nil {
+			t.Fatalf("query deposit: %v", err)
+		}
+		if state != "credited" {
+			t.Fatalf("deposit state = %q, want %q", state, "credited")
+		}
+
+		// Exactly one deposit_credit journal entry, its two postings, and one paired
+		// deposit.credited outbox row exist for this deposit.
+		var journalCount int
+		if err := env.pool.QueryRow(ctx,
+			`SELECT count(*) FROM journal_entries WHERE cause_type = 'deposit_credit' AND cause_id = $1`,
+			depositID,
+		).Scan(&journalCount); err != nil {
+			t.Fatalf("count journal_entries: %v", err)
+		}
+		if journalCount != 1 {
+			t.Fatalf("deposit_credit journal entries for deposit %s = %d, want exactly 1", depositID, journalCount)
+		}
+		var journalEntryID string
+		if err := env.pool.QueryRow(ctx,
+			`SELECT id FROM journal_entries WHERE cause_type = 'deposit_credit' AND cause_id = $1`,
+			depositID,
+		).Scan(&journalEntryID); err != nil {
+			t.Fatalf("query journal_entries id: %v", err)
+		}
+
+		var postingsN int
+		if err := env.pool.QueryRow(ctx, `SELECT count(*) FROM postings WHERE journal_entry_id = $1`, journalEntryID).Scan(&postingsN); err != nil {
+			t.Fatalf("query postings: %v", err)
+		}
+		if postingsN != 2 {
+			t.Fatalf("postings for journal entry %s = %d, want exactly 2", journalEntryID, postingsN)
+		}
+
+		var outboxN int
+		if err := env.pool.QueryRow(ctx,
+			`SELECT count(*) FROM outbox_events WHERE event_type = 'deposit.credited' AND payload->>'depositId' = $1`,
+			depositID,
+		).Scan(&outboxN); err != nil {
+			t.Fatalf("query outbox_events: %v", err)
+		}
+		if outboxN != 1 {
+			t.Fatalf("deposit.credited outbox events for deposit %s = %d, want exactly 1", depositID, outboxN)
+		}
+
+		// AC4: GET /customers/{id}/transactions shows it with type=deposit_credit,
+		// status=credited.
+		txnRec := getTransactions(t, env, customerID, "")
+		if txnRec.Code != http.StatusOK {
+			t.Fatalf("get transactions status = %d, want %d, body = %s", txnRec.Code, http.StatusOK, txnRec.Body.String())
+		}
+		var txnBody transactionsResponseBody
+		if err := json.Unmarshal(txnRec.Body.Bytes(), &txnBody); err != nil {
+			t.Fatalf("decode transactions response: %v", err)
+		}
+		var found bool
+		for _, txn := range txnBody.Transactions {
+			if txn.Type == "deposit_credit" {
+				found = true
+				if txn.Status != "credited" || txn.Amount != "2500000000000000000" || txn.Chain != "base" || txn.Asset != "eth" {
+					t.Fatalf("deposit_credit transaction = %+v, want status=credited amount=2500000000000000000 chain=base asset=eth", txn)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no deposit_credit transaction found in %+v", txnBody.Transactions)
+		}
+
+		// The customer's balance reflects the credited amount.
+		assertBalance(t, env, customerID, "base", "eth", "2500000000000000000")
+
+		// Design Notes: credited deposits surface only through transaction history, never
+		// through GET /customers/{id}/deposits (untouched by this story).
+		depRec := getDeposits(t, env, customerID)
+		if depRec.Code != http.StatusOK {
+			t.Fatalf("get deposits status = %d, want %d, body = %s", depRec.Code, http.StatusOK, depRec.Body.String())
+		}
+		var depBody depositsResponseBody
+		if err := json.Unmarshal(depRec.Body.Bytes(), &depBody); err != nil {
+			t.Fatalf("decode deposits response: %v", err)
+		}
+		if len(depBody.Deposits) != 0 {
+			t.Fatalf("deposits = %+v, want empty (credited deposits never appear on the pending-deposits endpoint)", depBody.Deposits)
+		}
+	})
+
+	t.Run("AC2: a credited deposit is never re-selected or re-credited by a later poll", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "credit-e2e-key-2")
+		depositAddress := customerDepositAddress(t, env, customerID)
+		seedDeposit(t, env, depositAddress, "base", "eth", "0xfinalized2", -1, "1000", 100, "finalized")
+
+		txCtx1, tx1, err := txBeginner.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin first transaction: %v", err)
+		}
+		credited1, err := depositRepo.CreditFinalizedDeposits(txCtx1, core.ChainBase)
+		if err != nil {
+			t.Fatalf("first CreditFinalizedDeposits() error = %v, want nil", err)
+		}
+		if credited1 != 1 {
+			t.Fatalf("first call credited count = %d, want 1", credited1)
+		}
+		if err := tx1.Commit(ctx); err != nil {
+			t.Fatalf("commit first transaction: %v", err)
+		}
+
+		txCtx2, tx2, err := txBeginner.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin second transaction: %v", err)
+		}
+		credited2, err := depositRepo.CreditFinalizedDeposits(txCtx2, core.ChainBase)
+		if err != nil {
+			t.Fatalf("second CreditFinalizedDeposits() error = %v, want nil", err)
+		}
+		if err := tx2.Commit(ctx); err != nil {
+			t.Fatalf("commit second transaction: %v", err)
+		}
+		if credited2 != 0 {
+			t.Fatalf("second call credited count = %d, want 0 (an already-credited deposit must never be re-selected)", credited2)
+		}
+
+		var journalCount int
+		if err := env.pool.QueryRow(ctx,
+			`SELECT count(*) FROM journal_entries je JOIN deposits d ON d.id::text = je.cause_id
+			 WHERE je.cause_type = 'deposit_credit' AND d.tx_hash = $1`,
+			"0xfinalized2",
+		).Scan(&journalCount); err != nil {
+			t.Fatalf("query journal_entries: %v", err)
+		}
+		if journalCount != 1 {
+			t.Fatalf("deposit_credit journal entries = %d, want exactly 1 (no double-credit across repeated calls)", journalCount)
+		}
+	})
+
+	t.Run("FR9: a (chain, asset) pair with no crediting_policy row is never credited — the policy join is load-bearing, not decorative", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "credit-e2e-key-3")
+		depositAddress := customerDepositAddress(t, env, customerID)
+		seedDeposit(t, env, depositAddress, "arbitrum", "usdc", "0xnopolicy1", -1, "5000000", 100, "finalized")
+
+		// Remove arbitrum/usdc's policy row for the duration of this subtest, restoring
+		// it afterward so later subtests (and this test's own shared env) see the normal
+		// seeded policy.
+		if _, err := env.pool.Exec(ctx, `DELETE FROM crediting_policy WHERE chain = 'arbitrum' AND asset = 'usdc'`); err != nil {
+			t.Fatalf("remove crediting_policy row: %v", err)
+		}
+		t.Cleanup(func() {
+			if _, err := env.pool.Exec(ctx,
+				`INSERT INTO crediting_policy (chain, asset, credit_tier) VALUES ('arbitrum', 'usdc', 'finalized')
+				 ON CONFLICT (chain, asset) DO NOTHING`,
+			); err != nil {
+				t.Fatalf("restore crediting_policy row: %v", err)
+			}
+		})
+
+		txCtx, tx, err := txBeginner.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin transaction: %v", err)
+		}
+		credited, err := depositRepo.CreditFinalizedDeposits(txCtx, core.ChainArbitrum)
+		if err != nil {
+			t.Fatalf("CreditFinalizedDeposits() error = %v, want nil", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit transaction: %v", err)
+		}
+		if credited != 0 {
+			t.Fatalf("credited count = %d, want 0 (no crediting_policy row for arbitrum/usdc — the join must exclude it, proving FR9's policy-table-driven claim)", credited)
+		}
+
+		var state string
+		if err := env.pool.QueryRow(ctx, `SELECT state FROM deposits WHERE tx_hash = $1`, "0xnopolicy1").Scan(&state); err != nil {
+			t.Fatalf("query deposit: %v", err)
+		}
+		if state != "finalized" {
+			t.Fatalf("deposit state = %q, want %q (left uncredited with no matching policy row)", state, "finalized")
+		}
+	})
+}
+
+// fakeReorgScanner is a minimal core.ChainScanner test double used only by
+// TestReorgDetection_EndToEnd — it drives the real TrackDeposits.Execute orchestration
+// (real Postgres, real DepositRepository) without needing a real anvil instance, since
+// scanner_test.go's real-anvil TestScanner_RealAnvil_BlockHash_ReflectsReorg already
+// proves BlockHash's real RPC behavior against a genuine anvil_reorg (AC3). Head and
+// ScanDeposits are configured to be inert (latest/safe/finalized all low, no transfers)
+// so the only effect a poll has is the reorg-check phase under test.
+type fakeReorgScanner struct {
+	latest, safe, finalized uint64
+	hashes                  map[uint64]string
+}
+
+func (s *fakeReorgScanner) Head(ctx context.Context) (uint64, uint64, uint64, error) {
+	return s.latest, s.safe, s.finalized, nil
+}
+
+func (s *fakeReorgScanner) BlockHash(ctx context.Context, blockNumber uint64) (string, bool, error) {
+	hash, ok := s.hashes[blockNumber]
+	return hash, ok, nil
+}
+
+func (s *fakeReorgScanner) ScanDeposits(ctx context.Context, knownAddresses []string, tokenRegistry map[string]core.Asset, fromBlock, toBlock uint64) ([]core.ObservedTransfer, []core.UnsupportedTokenObservation, error) {
+	return nil, nil, nil
+}
+
+var _ core.ChainScanner = (*fakeReorgScanner)(nil)
+
+// TestReorgDetection_EndToEnd exercises Story 2.4's reorg-detection path against real
+// Postgres: core.NewTrackDeposits is driven directly (mirroring
+// TestCreditFinalizedDeposits_EndToEnd's pattern of invoking a use case against the test
+// env's own postgres.TxBeginner) with a fake scanner standing in for the chain, so no
+// real RPC/anvil interaction is needed to prove the migration/deposit_repo/deposit_reader
+// path this story actually changes.
+func TestReorgDetection_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+	ctx := context.Background()
+
+	t.Run("AC1 & AC2: a reorged deposit is orphaned and visible as status orphaned; the same transaction reappearing afterward is a fresh observed row, never conflated with the orphaned one", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "reorg-e2e-key-1")
+		depositAddress := customerDepositAddress(t, env, customerID)
+
+		const (
+			txHash      = "0xreorgeddeposit1"
+			blockNumber = uint64(10)
+			staleHash   = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			newHash     = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		)
+		seedDepositWithHash(t, env, depositAddress, "base", "eth", txHash, -1, "1000", blockNumber, staleHash, "observed", time.Now().UTC())
+
+		addressLister := postgres.NewDepositAddressLister(env.pool)
+		tokenRegistry := postgres.NewTokenRegistry(env.pool)
+		depositRepo := postgres.NewDepositRepository()
+		unsupportedTokenRepo := postgres.NewUnsupportedTokenRepository(env.pool)
+		txBeginner := postgres.NewTxBeginner(env.pool)
+
+		// The chain's CURRENT hash at height 10 ("newHash") no longer matches the
+		// deposit's stored ("staleHash") — a competing history replaced this block.
+		scanner := &fakeReorgScanner{latest: 100, safe: 0, finalized: 0, hashes: map[uint64]string{blockNumber: newHash}}
+		trackDeposits := core.NewTrackDeposits(scanner, addressLister, tokenRegistry, depositRepo, unsupportedTokenRepo, txBeginner)
+
+		if err := trackDeposits.Execute(ctx, core.ChainBase); err != nil {
+			t.Fatalf("Execute() error = %v, want nil", err)
+		}
+
+		var state string
+		if err := env.pool.QueryRow(ctx, `SELECT state FROM deposits WHERE tx_hash = $1`, txHash).Scan(&state); err != nil {
+			t.Fatalf("query deposit: %v", err)
+		}
+		if state != "orphaned" {
+			t.Fatalf("state = %q, want %q", state, "orphaned")
+		}
+
+		// The paired deposit.orphaned outbox event was written in the same transaction
+		// (AD-4), mirroring deposit.pending/deposit.credited's own paired-write pattern.
+		var outboxCount int
+		if err := env.pool.QueryRow(ctx,
+			`SELECT count(*) FROM outbox_events oe JOIN deposits d ON d.id::text = oe.payload->>'depositId' WHERE oe.event_type = 'deposit.orphaned' AND d.tx_hash = $1`,
+			txHash,
+		).Scan(&outboxCount); err != nil {
+			t.Fatalf("query outbox_events: %v", err)
+		}
+		if outboxCount != 1 {
+			t.Fatalf("deposit.orphaned outbox events = %d, want exactly 1", outboxCount)
+		}
+
+		// AC2: the same transaction reappearing after the reorg inserts a brand-new
+		// observed row — never conflated with the orphaned one, thanks to migration
+		// 0008's partial unique index scoping (chain, tx_hash, log_index) uniqueness to
+		// non-orphaned rows.
+		seedDepositWithHash(t, env, depositAddress, "base", "eth", txHash, -1, "1000", blockNumber+5, newHash, "observed", time.Now().UTC())
+
+		var rowCount int
+		if err := env.pool.QueryRow(ctx, `SELECT count(*) FROM deposits WHERE tx_hash = $1`, txHash).Scan(&rowCount); err != nil {
+			t.Fatalf("count deposit rows: %v", err)
+		}
+		if rowCount != 2 {
+			t.Fatalf("deposit rows for %s = %d, want exactly 2 (the orphaned original + the fresh re-observation)", txHash, rowCount)
+		}
+
+		var origState string
+		if err := env.pool.QueryRow(ctx, `SELECT state FROM deposits WHERE tx_hash = $1 AND block_number = $2`, txHash, blockNumber).Scan(&origState); err != nil {
+			t.Fatalf("query original deposit: %v", err)
+		}
+		if origState != "orphaned" {
+			t.Fatalf("original deposit state = %q, want unchanged %q (untouched by the fresh re-observation)", origState, "orphaned")
+		}
+
+		// GET /customers/{id}/deposits shows both: the orphaned original with status
+		// "orphaned", and the fresh re-observation with status "pending".
+		rec := getDeposits(t, env, customerID)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body depositsResponseBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		var gotOrphaned, gotFresh bool
+		for _, d := range body.Deposits {
+			if d.TxHash != txHash {
+				continue
+			}
+			switch d.Tier {
+			case "orphaned":
+				gotOrphaned = true
+				if d.Status != "orphaned" {
+					t.Fatalf("orphaned deposit status = %q, want %q", d.Status, "orphaned")
+				}
+			case "observed":
+				gotFresh = true
+				if d.Status != "pending" {
+					t.Fatalf("fresh deposit status = %q, want %q", d.Status, "pending")
+				}
+			}
+		}
+		if !gotOrphaned {
+			t.Fatalf("no orphaned deposit visible in %+v (AC1: provisional visibility must reflect the reorg)", body.Deposits)
+		}
+		if !gotFresh {
+			t.Fatalf("no fresh observed deposit visible in %+v (AC2: the re-broadcast must appear, never double-counted)", body.Deposits)
+		}
+	})
+
+	t.Run("matching block hash: no change (on a separate chain, for full isolation from the subtest above)", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "reorg-e2e-key-2")
+		depositAddress := customerDepositAddress(t, env, customerID)
+
+		const (
+			txHash      = "0xstillvalid1"
+			blockNumber = uint64(20)
+			hash        = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		)
+		seedDepositWithHash(t, env, depositAddress, "arbitrum", "eth", txHash, -1, "500", blockNumber, hash, "observed", time.Now().UTC())
+
+		addressLister := postgres.NewDepositAddressLister(env.pool)
+		tokenRegistry := postgres.NewTokenRegistry(env.pool)
+		depositRepo := postgres.NewDepositRepository()
+		unsupportedTokenRepo := postgres.NewUnsupportedTokenRepository(env.pool)
+		txBeginner := postgres.NewTxBeginner(env.pool)
+		scanner := &fakeReorgScanner{latest: 100, safe: 0, finalized: 0, hashes: map[uint64]string{blockNumber: hash}}
+		trackDeposits := core.NewTrackDeposits(scanner, addressLister, tokenRegistry, depositRepo, unsupportedTokenRepo, txBeginner)
+
+		if err := trackDeposits.Execute(ctx, core.ChainArbitrum); err != nil {
+			t.Fatalf("Execute() error = %v, want nil", err)
+		}
+
+		var state string
+		if err := env.pool.QueryRow(ctx, `SELECT state FROM deposits WHERE tx_hash = $1`, txHash).Scan(&state); err != nil {
+			t.Fatalf("query deposit: %v", err)
+		}
+		if state != "observed" {
+			t.Fatalf("state = %q, want unchanged %q (stored hash still matches the chain's current hash)", state, "observed")
+		}
+	})
+}
+
+// seedUnsupportedTokenObservation inserts an unsupported_token_observations row directly
+// via test SQL — no watcher runs in this test, matching the story's instruction that
+// TestGetUnsupportedTokenObservations_EndToEnd seeds the row directly rather than driving
+// it through a real scan.
+func seedUnsupportedTokenObservation(t *testing.T, env testEnv, address, chain, contractAddress, txHash string, logIndex int, amount string, blockNumber uint64) {
+	t.Helper()
+	if _, err := env.pool.Exec(context.Background(),
+		`INSERT INTO unsupported_token_observations (id, chain, address, contract_address, tx_hash, log_index, amount, block_number, observed_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, now())`,
+		uuid.New().String(), chain, address, contractAddress, txHash, logIndex, amount, blockNumber,
+	); err != nil {
+		t.Fatalf("seed unsupported_token_observations fixture row: %v", err)
+	}
+}
+
+// getUnsupportedTokenObservations issues a GET /v1/unsupported-token-observations
+// request and returns the recorded response. bearer controls whether the Authorization
+// header is set, so the same helper covers both the happy path and the auth-required
+// assertion.
+func getUnsupportedTokenObservations(t *testing.T, env testEnv, bearer bool) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/unsupported-token-observations", nil)
+	if bearer {
+		req.Header.Set("Authorization", "Bearer test-token")
+	}
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestGetUnsupportedTokenObservations_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("AC3: a seeded observation is returned with its contract address and amount", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "unsupported-e2e-key-1")
+		depositAddress := customerDepositAddress(t, env, customerID)
+
+		seedUnsupportedTokenObservation(t, env, depositAddress, "base", "0xdeadbeef0000000000000000000000000000dead", "0xunsupported1", 2, "123456", 77)
+
+		rec := getUnsupportedTokenObservations(t, env, true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var body struct {
+			Observations []struct {
+				ID              string    `json:"id"`
+				Chain           string    `json:"chain"`
+				DepositAddress  string    `json:"depositAddress"`
+				ContractAddress string    `json:"contractAddress"`
+				TxHash          string    `json:"txHash"`
+				Amount          string    `json:"amount"`
+				BlockNumber     int64     `json:"blockNumber"`
+				ObservedAt      time.Time `json:"observedAt"`
+			} `json:"observations"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+
+		var found bool
+		for _, o := range body.Observations {
+			if o.TxHash == "0xunsupported1" {
+				found = true
+				if o.ContractAddress != "0xdeadbeef0000000000000000000000000000dead" || o.Amount != "123456" || o.Chain != "base" || o.DepositAddress != depositAddress || o.BlockNumber != 77 {
+					t.Fatalf("observation = %+v, want contractAddress=0xdeadbeef0000000000000000000000000000dead amount=123456 chain=base depositAddress=%s blockNumber=77", o, depositAddress)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no observation with txHash 0xunsupported1 found in %+v", body.Observations)
+		}
+	})
+
+	t.Run("never produces a deposits row or a journal posting for the same seeded fixture", func(t *testing.T) {
+		var depositCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM deposits WHERE tx_hash = $1`, "0xunsupported1",
+		).Scan(&depositCount); err != nil {
+			t.Fatalf("query deposits: %v", err)
+		}
+		if depositCount != 0 {
+			t.Fatalf("deposits rows for unsupported tx = %d, want 0 (never a deposit, FR11)", depositCount)
+		}
+	})
+
+	t.Run("missing bearer token is rejected", func(t *testing.T) {
+		rec := getUnsupportedTokenObservations(t, env, false)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("token_registry rejects an asset value this system can't interpret (re-review 2026-07-17)", func(t *testing.T) {
+		// Proves the DB CHECK is real, not just claimed — the exact gap that let an
+		// earlier overclaiming comment about "any new ERC-20, zero code change" go
+		// uncaught: registering a genuinely new asset type still requires extending
+		// core.Asset's closed enum, and this constraint is what actually enforces that
+		// today, not just documentation.
+		_, err := env.pool.Exec(context.Background(),
+			`INSERT INTO token_registry (chain, contract_address, asset) VALUES ($1, $2, $3)`,
+			"base", "0x2222222222222222222222222222222222222222", "weth",
+		)
+		if err == nil {
+			t.Fatal("expected inserting an unrecognized asset into token_registry to fail its CHECK constraint, got nil error")
 		}
 	})
 }

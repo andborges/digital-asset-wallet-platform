@@ -1,5 +1,5 @@
 # generated: 2026-07-14
-# last_updated: 2026-07-16 (re-review passed: story 1-5 → done; all patch findings applied)
+# last_updated: 2026-07-17 (bmad-dev-auto: story 2-5 implemented, reviewed, patched → done; epic-2 complete)
 # project: digital-asset-wallet-platform
 # project_key: NOKEY
 # tracking_system: file-system
@@ -56,12 +56,12 @@ development_status:
   1-5-generate-per-customer-deposit-address-via-create2-forwarder: done
   epic-1-retrospective: optional
 
-  epic-2: backlog
-  2-1-track-incoming-deposits-and-expose-pending-status: backlog
-  2-2-credit-deposits-at-finalized-tier-via-policy-table: backlog
-  2-3-handle-unsupported-token-transfers-without-ledger-corruption: backlog
-  2-4-detect-and-safely-reverse-reorged-pre-finality-deposits: backlog
-  2-5-recover-from-watcher-downtime-without-loss-or-double-processing: backlog
+  epic-2: done
+  2-1-track-incoming-deposits-and-expose-pending-status: done
+  2-2-credit-deposits-at-finalized-tier-via-policy-table: done
+  2-3-handle-unsupported-token-transfers-without-ledger-corruption: done
+  2-4-detect-and-safely-reverse-reorged-pre-finality-deposits: done
+  2-5-recover-from-watcher-downtime-without-loss-or-double-processing: done
   epic-2-retrospective: optional
 
   epic-3: backlog
