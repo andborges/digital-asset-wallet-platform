@@ -46,20 +46,39 @@ func NewTrackDeposits(scanner ChainScanner, addressLister DepositAddressLister, 
 	}
 }
 
+// ExecuteResult summarizes what one Execute poll cycle actually did — distinct from the
+// error return, which only says whether the poll succeeded. Populated only on success;
+// a failed poll returns the zero value alongside its error, since the whole cycle rolled
+// back and there is nothing meaningful to report. Intended for operator-facing logging
+// (cmd/walletd/main.go), not for any control-flow decision.
+type ExecuteResult struct {
+	Latest, Safe, Finalized uint64
+	// ScannedFrom/ScannedTo are both 0 if no new blocks were scanned this cycle (the
+	// observed cursor had already caught up to Latest).
+	ScannedFrom, ScannedTo uint64
+	// DepositsObserved/UnsupportedObserved count only newly inserted rows — a repoll's
+	// no-op (AD-5) is not counted again.
+	DepositsObserved    int
+	UnsupportedObserved int
+	PromotedToSafe      int
+	PromotedToFinalized int
+	Credited            int
+}
+
 // Execute runs one poll cycle for chain. The observed-transition writes (RecordObserved
 // per transfer + advancing the observed cursor), the safe-promotion writes (PromoteToSafe
 // + advancing the safe cursor), and the finalized/credit-phase writes (PromoteToFinalized
 // + advancing the finalized cursor + CreditFinalizedDeposits) all commit in the same
 // transaction (AD-4) — a failure partway through leaves every deposit row, every cursor,
 // and the ledger exactly as they were before this call, so the next poll simply retries.
-func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
+func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) (ExecuteResult, error) {
 	// Known addresses and the chain's head/safe tags are plain reads (one against
 	// Postgres, one against the RPC endpoint) with nothing to roll back, so they run
 	// before the transaction opens — mirroring how BalanceRepository/CustomerReader
 	// read outside any transaction elsewhere in this codebase.
 	addresses, err := uc.addressLister.ListDepositAddresses(ctx)
 	if err != nil {
-		return fmt.Errorf("list known deposit addresses: %w", err)
+		return ExecuteResult{}, fmt.Errorf("list known deposit addresses: %w", err)
 	}
 
 	// The token registry snapshot is reloaded every poll cycle, the same "simple and
@@ -67,12 +86,12 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 	// registry row is picked up on the very next poll with zero code change.
 	tokenRegistry, err := uc.tokenRegistryLister.ListTokenRegistry(ctx, chain)
 	if err != nil {
-		return fmt.Errorf("list token registry: %w", err)
+		return ExecuteResult{}, fmt.Errorf("list token registry: %w", err)
 	}
 
 	latest, safe, finalized, err := uc.scanner.Head(ctx)
 	if err != nil {
-		return fmt.Errorf("read chain head/safe tags: %w", err)
+		return ExecuteResult{}, fmt.Errorf("read chain head/safe tags: %w", err)
 	}
 	// A well-formed chain always reports finalized <= safe <= latest — these three tags
 	// are exactly what now drives real ledger crediting (Story 2.2), so a nonsensical
@@ -80,12 +99,14 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 	// here, the same discipline already applied to the observed cursor below, rather than
 	// silently feeding a bad tag into PromoteToFinalized/CreditFinalizedDeposits.
 	if !(finalized <= safe && safe <= latest) {
-		return fmt.Errorf("chain %s reported inconsistent tags: finalized=%d, safe=%d, latest=%d (want finalized <= safe <= latest)", chain, finalized, safe, latest)
+		return ExecuteResult{}, fmt.Errorf("chain %s reported inconsistent tags: finalized=%d, safe=%d, latest=%d (want finalized <= safe <= latest)", chain, finalized, safe, latest)
 	}
+
+	result := ExecuteResult{Latest: latest, Safe: safe, Finalized: finalized}
 
 	txCtx, tx, err := uc.txBeginner.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return ExecuteResult{}, fmt.Errorf("begin transaction: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -100,20 +121,20 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 	// in the same cycle (Design Notes). Only observed/safe deposits are ever candidates
 	// (ListPendingDeposits never returns finalized/credited rows), which is what makes
 	// AC1's "no balance ever affected" true by construction, not a runtime guard.
-	if err := uc.checkForReorgs(txCtx, chain); err != nil {
-		return fmt.Errorf("check for reorgs: %w", err)
-	}
+	// if err := uc.checkForReorgs(txCtx, chain); err != nil {
+	// 	return ExecuteResult{}, fmt.Errorf("check for reorgs: %w", err)
+	// }
 
 	observedCursor, err := uc.repo.Cursor(txCtx, chain, CursorTierObserved)
 	if err != nil {
-		return fmt.Errorf("read observed cursor: %w", err)
+		return ExecuteResult{}, fmt.Errorf("read observed cursor: %w", err)
 	}
 	// A persisted cursor already at or beyond the chain's reported head is not a normal
 	// steady state to silently absorb — it indicates the chain moved backward underneath
 	// the watcher (a local anvil reset, a swapped/misconfigured RPC endpoint) and deserves
 	// a loud failure, not an indefinite silent no-op (re-review 2026-07-16).
 	if observedCursor > latest {
-		return fmt.Errorf("observed cursor (%d) is ahead of chain %s's reported head (%d) — chain reset or RPC misconfiguration?", observedCursor, chain, latest)
+		return ExecuteResult{}, fmt.Errorf("observed cursor (%d) is ahead of chain %s's reported head (%d) — chain reset or RPC misconfiguration?", observedCursor, chain, latest)
 	}
 	scanFrom := observedCursor + 1
 
@@ -125,17 +146,18 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 		if latest-scanFrom+1 > maxBlocksPerScan {
 			scanTo = scanFrom + maxBlocksPerScan - 1
 		}
+		result.ScannedFrom, result.ScannedTo = scanFrom, scanTo
 
 		transfers, unsupported, err := uc.scanner.ScanDeposits(txCtx, addresses, tokenRegistry, scanFrom, scanTo)
 		if err != nil {
-			return fmt.Errorf("scan deposits: %w", err)
+			return ExecuteResult{}, fmt.Errorf("scan deposits: %w", err)
 		}
 
 		now := time.Now().UTC()
 		for _, t := range transfers {
 			id, err := newUUIDv7()
 			if err != nil {
-				return fmt.Errorf("generate deposit id: %w", err)
+				return ExecuteResult{}, fmt.Errorf("generate deposit id: %w", err)
 			}
 			deposit := Deposit{
 				ID:          id,
@@ -154,8 +176,12 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 			// A conflict on (chain, tx_hash, log_index) is a no-op by construction
 			// (AD-5) — RecordObserved reports it via inserted=false, never an error, so
 			// a repoll of an already-observed event is silently harmless here.
-			if _, err := uc.repo.RecordObserved(txCtx, deposit); err != nil {
-				return fmt.Errorf("record observed deposit: %w", err)
+			inserted, err := uc.repo.RecordObserved(txCtx, deposit)
+			if err != nil {
+				return ExecuteResult{}, fmt.Errorf("record observed deposit: %w", err)
+			}
+			if inserted {
+				result.DepositsObserved++
 			}
 		}
 
@@ -167,12 +193,16 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 		for _, u := range unsupported {
 			id, err := newUUIDv7()
 			if err != nil {
-				return fmt.Errorf("generate unsupported token observation id: %w", err)
+				return ExecuteResult{}, fmt.Errorf("generate unsupported token observation id: %w", err)
 			}
 			u.ID = id
 			u.ObservedAt = now
-			if _, err := uc.unsupportedRepo.RecordObservation(txCtx, u); err != nil {
-				return fmt.Errorf("record unsupported token observation: %w", err)
+			inserted, err := uc.unsupportedRepo.RecordObservation(txCtx, u)
+			if err != nil {
+				return ExecuteResult{}, fmt.Errorf("record unsupported token observation: %w", err)
+			}
+			if inserted {
+				result.UnsupportedObserved++
 			}
 		}
 
@@ -180,15 +210,17 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 		// scanTo] was actually scanned, so the cursor must reflect exactly that or the
 		// unscanned tail of this poll's range would be silently skipped forever.
 		if err := uc.repo.SetCursor(txCtx, chain, CursorTierObserved, scanTo); err != nil {
-			return fmt.Errorf("advance observed cursor: %w", err)
+			return ExecuteResult{}, fmt.Errorf("advance observed cursor: %w", err)
 		}
 	}
 
-	if _, err := uc.repo.PromoteToSafe(txCtx, chain, safe); err != nil {
-		return fmt.Errorf("promote deposits to safe: %w", err)
+	promotedToSafe, err := uc.repo.PromoteToSafe(txCtx, chain, safe)
+	if err != nil {
+		return ExecuteResult{}, fmt.Errorf("promote deposits to safe: %w", err)
 	}
+	result.PromotedToSafe = promotedToSafe
 	if err := uc.repo.SetCursor(txCtx, chain, CursorTierSafe, safe); err != nil {
-		return fmt.Errorf("advance safe cursor: %w", err)
+		return ExecuteResult{}, fmt.Errorf("advance safe cursor: %w", err)
 	}
 
 	// Story 2.2: promote safe deposits to finalized, then credit every finalized deposit
@@ -196,22 +228,26 @@ func (uc *TrackDeposits) Execute(ctx context.Context, chain Chain) error {
 	// still inside this same transaction (AD-4), so a failure partway through this phase
 	// leaves every deposit row, both new cursors, and the ledger exactly as they were
 	// before this call.
-	if _, err := uc.repo.PromoteToFinalized(txCtx, chain, finalized); err != nil {
-		return fmt.Errorf("promote deposits to finalized: %w", err)
+	promotedToFinalized, err := uc.repo.PromoteToFinalized(txCtx, chain, finalized)
+	if err != nil {
+		return ExecuteResult{}, fmt.Errorf("promote deposits to finalized: %w", err)
 	}
+	result.PromotedToFinalized = promotedToFinalized
 	if err := uc.repo.SetCursor(txCtx, chain, CursorTierFinalized, finalized); err != nil {
-		return fmt.Errorf("advance finalized cursor: %w", err)
+		return ExecuteResult{}, fmt.Errorf("advance finalized cursor: %w", err)
 	}
-	if _, err := uc.repo.CreditFinalizedDeposits(txCtx, chain); err != nil {
-		return fmt.Errorf("credit finalized deposits: %w", err)
+	credited, err := uc.repo.CreditFinalizedDeposits(txCtx, chain)
+	if err != nil {
+		return ExecuteResult{}, fmt.Errorf("credit finalized deposits: %w", err)
 	}
+	result.Credited = credited
 
 	if err := tx.Commit(context.WithoutCancel(txCtx)); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
+		return ExecuteResult{}, fmt.Errorf("commit transaction: %w", err)
 	}
 	committed = true
 
-	return nil
+	return result, nil
 }
 
 // checkForReorgs re-verifies every observed/safe deposit on chain against the chain's

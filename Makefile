@@ -1,4 +1,4 @@
-.PHONY: help build vet fmt fmt-check check-import-boundary lint test test-unit up down swagger-ui env run contracts-build contracts-test
+.PHONY: help build vet fmt fmt-check check-import-boundary lint test test-unit up down swagger-ui env run watcher contracts-build contracts-test
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -42,6 +42,10 @@ down: ## Stop and remove the local Postgres container
 
 run: env ## Run the API locally against the Dockerized Postgres (loads .env)
 	set -a && . ./.env && set +a && go run ./cmd/walletd api
+
+watcher: env ## Run the watcher for one chain, against the Dockerized Postgres (usage: make watcher CHAIN=base|arbitrum)
+	@if [ -z "$(CHAIN)" ]; then echo "usage: make watcher CHAIN=base|arbitrum"; exit 1; fi
+	set -a && . ./.env && set +a && go run ./cmd/walletd watcher --chain=$(CHAIN)
 
 contracts-build: ## Compile the Foundry contracts project (factory + forwarder)
 	cd contracts && forge build

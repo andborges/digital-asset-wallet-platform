@@ -413,8 +413,24 @@ func runWatcher(logger *slog.Logger, args []string) error {
 	// whole watcher process; the next tick simply retries the same block range (the
 	// cursor never advanced past the failed poll).
 	for {
-		if err := trackDeposits.Execute(ctx, coreChain); err != nil {
+		logger.Info("watcher poll started", "chain", *chainName)
+		result, err := trackDeposits.Execute(ctx, coreChain)
+		if err != nil {
 			logger.Error("watcher poll failed", "chain", *chainName, "error", err)
+		} else {
+			logger.Info("watcher poll completed",
+				"chain", *chainName,
+				"latest", result.Latest,
+				"safe", result.Safe,
+				"finalized", result.Finalized,
+				"scannedFrom", result.ScannedFrom,
+				"scannedTo", result.ScannedTo,
+				"depositsObserved", result.DepositsObserved,
+				"unsupportedObserved", result.UnsupportedObserved,
+				"promotedToSafe", result.PromotedToSafe,
+				"promotedToFinalized", result.PromotedToFinalized,
+				"credited", result.Credited,
+			)
 		}
 
 		select {

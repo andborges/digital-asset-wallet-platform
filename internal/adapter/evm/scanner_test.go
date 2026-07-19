@@ -3,6 +3,7 @@ package evm
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -555,4 +557,92 @@ func waitForReceipt(ctx context.Context, client *ethclient.Client, txHash common
 		time.Sleep(50 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("timed out waiting for receipt of %s", txHash.Hex())
+}
+
+// fakeRawBlockClient is a minimal scanClient fake that returns a fixed raw JSON payload
+// for eth_getBlockByNumber, regardless of the requested block number — just enough to
+// prove scanNativeTransfers tolerates a transaction type go-ethereum's own decoder would
+// reject (production bug fix, 2026-07-17: see scanClient's doc comment). Every other
+// scanClient method is unused by that test and panics if called, so a test that
+// accidentally relies on them fails loudly instead of silently returning zero values.
+type fakeRawBlockClient struct {
+	blockJSON []byte
+}
+
+func (f *fakeRawBlockClient) BlockNumber(ctx context.Context) (uint64, error) {
+	panic("not used by this test")
+}
+
+func (f *fakeRawBlockClient) HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error) {
+	panic("not used by this test")
+}
+
+func (f *fakeRawBlockClient) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error) {
+	panic("not used by this test")
+}
+
+func (f *fakeRawBlockClient) CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
+	if method != "eth_getBlockByNumber" {
+		return fmt.Errorf("unexpected method %q", method)
+	}
+	return json.Unmarshal(f.blockJSON, result)
+}
+
+func (f *fakeRawBlockClient) Close() {}
+
+// TestScanNativeTransfers_TolerantOfUnrecognizedTransactionType proves the production bug
+// fix (2026-07-17): a block containing a transaction whose "type" byte go-ethereum's own
+// decoder doesn't recognize — e.g. Arbitrum's 0x64-0x6a deposit/internal transaction types
+// (an ArbitrumInternalTx is the first transaction of nearly every Nitro block) or
+// Base/OP-stack's 0x7e deposit transaction type (emitted whenever a user bridges from L1)
+// — no longer fails the whole scan. Before the fix, ethclient.BlockByNumber's typed
+// transaction decoding rejected any unrecognized type outright ("transaction type not
+// supported"), breaking native-ETH scanning on real chains entirely. This can't be
+// exercised against real anvil, since anvil never emits these chain-specific transaction
+// types — hence a fake at the raw-JSON level.
+func TestScanNativeTransfers_TolerantOfUnrecognizedTransactionType(t *testing.T) {
+	t.Parallel()
+
+	depositAddress := common.HexToAddress("0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa")
+
+	// Two transactions to the same known address: one with an unrecognized type byte
+	// (0x64, Arbitrum's ArbitrumDepositTx), one with a standard type (0x2, EIP-1559) —
+	// both must be decoded and returned as transfers, proving the unrecognized-type
+	// transaction's own data (not just its presence) is handled correctly, not merely
+	// tolerated without a crash.
+	blockJSON := fmt.Sprintf(`{
+		"hash": "0x%s",
+		"transactions": [
+			{"hash": "0x%s", "type": "0x64", "to": "%s", "value": "0x1"},
+			{"hash": "0x%s", "type": "0x2",  "to": "%s", "value": "0xde0b6b3a7640000"}
+		]
+	}`,
+		strings.Repeat("aa", 32),
+		strings.Repeat("11", 32), depositAddress.Hex(),
+		strings.Repeat("22", 32), depositAddress.Hex(),
+	)
+
+	scanner := &Scanner{
+		chain:  Chain{Name: "arbitrum"},
+		client: &fakeRawBlockClient{blockJSON: []byte(blockJSON)},
+	}
+
+	known := map[common.Address]string{depositAddress: depositAddress.Hex()}
+	transfers, err := scanner.scanNativeTransfers(context.Background(), known, 1, 1)
+	if err != nil {
+		t.Fatalf("scanNativeTransfers() error = %v, want nil — an unrecognized transaction type must not fail the scan", err)
+	}
+	if len(transfers) != 2 {
+		t.Fatalf("transfers = %+v, want exactly 2 (both the unrecognized-type and the standard-type transaction to the known address)", transfers)
+	}
+	byAmount := map[string]bool{}
+	for _, tr := range transfers {
+		if tr.Address != depositAddress.Hex() {
+			t.Fatalf("transfer address = %q, want %q", tr.Address, depositAddress.Hex())
+		}
+		byAmount[tr.Amount.String()] = true
+	}
+	if !byAmount["1"] || !byAmount["1000000000000000000"] {
+		t.Fatalf("transfer amounts = %v, want both \"1\" (from the unrecognized-type tx) and \"1000000000000000000\" (from the standard tx)", byAmount)
+	}
 }

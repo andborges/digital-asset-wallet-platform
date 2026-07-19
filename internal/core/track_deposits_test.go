@@ -376,7 +376,7 @@ func TestTrackDeposits_Execute_NewObservedDeposit(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -421,7 +421,7 @@ func TestTrackDeposits_Execute_RepollSameEventIsNoOp(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("first Execute() error = %v, want nil", err)
 	}
 	if len(repo.inserted) != 1 {
@@ -433,7 +433,7 @@ func TestTrackDeposits_Execute_RepollSameEventIsNoOp(t *testing.T) {
 	// scenario the (chain, tx_hash, log_index) unique constraint exists to make a
 	// harmless no-op (AD-5), never an application-level existence check.
 	scanner.latest = 200
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("second Execute() error = %v, want nil", err)
 	}
 
@@ -465,7 +465,7 @@ func TestTrackDeposits_Execute_PromotesObservedToSafe(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -512,7 +512,7 @@ func TestTrackDeposits_Execute_UnsupportedTokenTransferIsIgnored(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 	if len(repo.inserted) != 0 {
@@ -546,7 +546,7 @@ func TestTrackDeposits_Execute_UnsupportedTokenObservationIsRecorded(t *testing.
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -585,7 +585,7 @@ func TestTrackDeposits_Execute_NoNewBlocksSkipsScan(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 	if scanner.scanCalls != 0 {
@@ -611,7 +611,7 @@ func TestTrackDeposits_Execute_PromotesFinalizedAndCreditsInSamePoll(t *testing.
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -664,7 +664,7 @@ func TestTrackDeposits_Execute_CreditedDepositNeverReCredited(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -691,7 +691,7 @@ func TestTrackDeposits_Execute_ReorgCheck_MatchingHashNoChange(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -729,7 +729,7 @@ func TestTrackDeposits_Execute_ReorgCheck_MismatchedHashOrphans(t *testing.T) {
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -768,7 +768,7 @@ func TestTrackDeposits_Execute_ReorgCheck_HeightBeyondChainHeadOrphans(t *testin
 	txb := &fakeTxBeginner{}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
@@ -798,7 +798,7 @@ func TestTrackDeposits_Execute_ReorgCheck_OrphanedDepositNeverReselected(t *test
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
 	// First poll: mismatch detected, the deposit is orphaned.
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("first Execute() error = %v, want nil", err)
 	}
 	if repo.inserted[0].State != core.DepositOrphaned {
@@ -811,7 +811,7 @@ func TestTrackDeposits_Execute_ReorgCheck_OrphanedDepositNeverReselected(t *test
 	// Second poll: the same (now-orphaned) deposit must never be re-selected, even
 	// though its stored block_hash still "mismatches" scanner.blockHashes[40].
 	scanner.blockHashCalls = nil
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("second Execute() error = %v, want nil", err)
 	}
 	if len(scanner.blockHashCalls) != 0 {
@@ -859,7 +859,7 @@ func TestTrackDeposits_Execute_MultiPollCatchUpAfterDowntime(t *testing.T) {
 		if repo.cursors["base/"+core.CursorTierObserved] >= latest {
 			break
 		}
-		if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+		if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 			t.Fatalf("Execute() call %d error = %v, want nil", i+1, err)
 		}
 		cursorsAfterEachCall = append(cursorsAfterEachCall, repo.cursors["base/"+core.CursorTierObserved])
@@ -950,7 +950,7 @@ func TestTrackDeposits_Execute_MidBatchScanFailureRollsBackCleanly(t *testing.T)
 	txb := &fakeTxBeginner{repo: repo}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	err := uc.Execute(context.Background(), core.ChainBase)
+	_, err := uc.Execute(context.Background(), core.ChainBase)
 	if err == nil {
 		t.Fatal("Execute() error = nil, want an error from the simulated mid-batch RecordObserved failure")
 	}
@@ -1010,7 +1010,7 @@ func TestTrackDeposits_Execute_RetryAfterMidBatchFailureRecoversFully(t *testing
 	txb := &fakeTxBeginner{repo: repo}
 	uc := core.NewTrackDeposits(scanner, lister, tokenRegistryLister, repo, unsupportedRepo, txb)
 
-	if err := uc.Execute(context.Background(), core.ChainBase); err == nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err == nil {
 		t.Fatal("first Execute() error = nil, want the simulated mid-batch failure")
 	}
 	if len(repo.inserted) != 0 {
@@ -1022,7 +1022,7 @@ func TestTrackDeposits_Execute_RetryAfterMidBatchFailureRecoversFully(t *testing
 	// failed attempt, so the next Execute call computes the identical [fromBlock,
 	// toBlock].
 	repo.recordObservedFailAt = 0
-	if err := uc.Execute(context.Background(), core.ChainBase); err != nil {
+	if _, err := uc.Execute(context.Background(), core.ChainBase); err != nil {
 		t.Fatalf("retry Execute() error = %v, want nil", err)
 	}
 

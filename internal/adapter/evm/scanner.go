@@ -9,6 +9,7 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -29,12 +30,68 @@ var erc20TransferSignature = crypto.Keccak256Hash([]byte("Transfer(address,addre
 
 // scanClient is the minimal RPC surface Head and ScanDeposits need — small enough to
 // fake in unit tests without a real chain, the same shape as chainClient in deployer.go.
+//
+// CallContext (production bug fix, 2026-07-17), not BlockByNumber: go-ethereum's
+// BlockByNumber decodes every transaction in a block into its strict *types.Transaction,
+// which rejects any transaction type byte it doesn't recognize. Both Arbitrum (deposit/
+// internal tx types 0x64-0x6A — an ArbitrumInternalTx is the first transaction of nearly
+// every Nitro block) and Base/OP-stack (deposit tx type 0x7E, emitted whenever a user
+// bridges from L1) routinely include such transactions in ordinary blocks, which made
+// BlockByNumber fail outright in production ("transaction type not supported") — this
+// wasn't caught by any anvil-based test because anvil never emits these chain-specific
+// transaction types. scanNativeTransfers instead fetches raw eth_getBlockByNumber JSON via
+// CallContext and decodes only to/value/hash, fields present on every EVM transaction type
+// regardless of its type byte.
 type scanClient interface {
 	BlockNumber(ctx context.Context) (uint64, error)
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
-	BlockByNumber(ctx context.Context, number *big.Int) (*types.Block, error)
 	FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error)
+	CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
 	Close()
+}
+
+// scanClientImpl adapts *ethclient.Client to scanClient, adding the raw CallContext
+// escape hatch (via the underlying *rpc.Client) that BlockNumber/HeaderByNumber/
+// FilterLogs/Close all already satisfy directly on *ethclient.Client.
+type scanClientImpl struct {
+	ec *ethclient.Client
+}
+
+func (c *scanClientImpl) BlockNumber(ctx context.Context) (uint64, error) {
+	return c.ec.BlockNumber(ctx)
+}
+
+func (c *scanClientImpl) HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error) {
+	return c.ec.HeaderByNumber(ctx, number)
+}
+
+func (c *scanClientImpl) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error) {
+	return c.ec.FilterLogs(ctx, q)
+}
+
+func (c *scanClientImpl) CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
+	return c.ec.Client().CallContext(ctx, result, method, args...)
+}
+
+func (c *scanClientImpl) Close() {
+	c.ec.Close()
+}
+
+// rawBlockTransaction is the minimal per-transaction shape scanNativeTransfers needs,
+// decoded directly from raw eth_getBlockByNumber JSON — see scanClient's doc comment for
+// why. to/value/hash are present on every EVM transaction type's JSON representation
+// regardless of its "type" field, so decoding just these three tolerates any type byte,
+// recognized or not.
+type rawBlockTransaction struct {
+	Hash  common.Hash     `json:"hash"`
+	To    *common.Address `json:"to"`
+	Value *hexutil.Big    `json:"value"`
+}
+
+// rawBlock is the minimal eth_getBlockByNumber response shape scanNativeTransfers needs.
+type rawBlock struct {
+	Hash         common.Hash           `json:"hash"`
+	Transactions []rawBlockTransaction `json:"transactions"`
 }
 
 // Scanner implements core.ChainScanner against one configured chain's RPC endpoint via
@@ -53,7 +110,7 @@ func NewScanner(ctx context.Context, chain Chain) (*Scanner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s RPC %q: %w", chain.Name, chain.RPCURL, err)
 	}
-	return &Scanner{chain: chain, client: client}, nil
+	return &Scanner{chain: chain, client: &scanClientImpl{ec: client}}, nil
 }
 
 // Close releases the underlying RPC connection.
@@ -150,35 +207,43 @@ func (s *Scanner) ScanDeposits(ctx context.Context, knownAddresses []string, tok
 // scanNativeTransfers walks every block in [fromBlock, toBlock], looking for plain value
 // transfers whose tx.To() lands on a known deposit address. There is no log to filter on
 // for a native transfer, so every transaction in range must be inspected directly.
+//
+// Fetched via raw eth_getBlockByNumber JSON (CallContext), not go-ethereum's BlockByNumber
+// (production bug fix, 2026-07-17 — see scanClient's doc comment): BlockByNumber's typed
+// transaction decoding rejects Arbitrum/OP-stack-style transaction types that routinely
+// appear in ordinary blocks on both configured chains.
 func (s *Scanner) scanNativeTransfers(ctx context.Context, known map[common.Address]string, fromBlock, toBlock uint64) ([]core.ObservedTransfer, error) {
 	var transfers []core.ObservedTransfer
 
 	for blockNum := fromBlock; blockNum <= toBlock; blockNum++ {
-		block, err := s.client.BlockByNumber(ctx, new(big.Int).SetUint64(blockNum))
-		if err != nil {
+		var block rawBlock
+		if err := s.client.CallContext(ctx, &block, "eth_getBlockByNumber", hexutil.EncodeUint64(blockNum), true); err != nil {
 			return nil, fmt.Errorf("query %s for block %d: %w", s.chain.Name, blockNum, err)
 		}
-		for _, tx := range block.Transactions() {
-			to := tx.To()
-			if to == nil {
+		for _, tx := range block.Transactions {
+			if tx.To == nil {
 				// Contract creation — never a transfer to an already-known address.
 				continue
 			}
-			addr, ok := known[*to]
-			if !ok || tx.Value().Sign() <= 0 {
+			addr, ok := known[*tx.To]
+			if !ok {
+				continue
+			}
+			value := (*big.Int)(tx.Value)
+			if value == nil || value.Sign() <= 0 {
 				continue
 			}
 			transfers = append(transfers, core.ObservedTransfer{
 				Chain:       core.Chain(s.chain.Name),
 				Asset:       core.AssetETH,
 				Address:     addr,
-				TxHash:      tx.Hash().Hex(),
+				TxHash:      tx.Hash.Hex(),
 				LogIndex:    nativeTransferLogIndex,
-				Amount:      new(big.Int).Set(tx.Value()),
+				Amount:      new(big.Int).Set(value),
 				BlockNumber: blockNum,
 				// BlockHash comes from the block already fetched above (Story 2.4) — never
 				// a second RPC round-trip just to learn a hash this call already has.
-				BlockHash: block.Hash().Hex(),
+				BlockHash: block.Hash.Hex(),
 			})
 		}
 	}

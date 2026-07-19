@@ -1585,7 +1585,7 @@ func TestReorgDetection_EndToEnd(t *testing.T) {
 		scanner := &fakeReorgScanner{latest: 100, safe: 0, finalized: 0, hashes: map[uint64]string{blockNumber: newHash}}
 		trackDeposits := core.NewTrackDeposits(scanner, addressLister, tokenRegistry, depositRepo, unsupportedTokenRepo, txBeginner)
 
-		if err := trackDeposits.Execute(ctx, core.ChainBase); err != nil {
+		if _, err := trackDeposits.Execute(ctx, core.ChainBase); err != nil {
 			t.Fatalf("Execute() error = %v, want nil", err)
 		}
 
@@ -1687,7 +1687,7 @@ func TestReorgDetection_EndToEnd(t *testing.T) {
 		scanner := &fakeReorgScanner{latest: 100, safe: 0, finalized: 0, hashes: map[uint64]string{blockNumber: hash}}
 		trackDeposits := core.NewTrackDeposits(scanner, addressLister, tokenRegistry, depositRepo, unsupportedTokenRepo, txBeginner)
 
-		if err := trackDeposits.Execute(ctx, core.ChainArbitrum); err != nil {
+		if _, err := trackDeposits.Execute(ctx, core.ChainArbitrum); err != nil {
 			t.Fatalf("Execute() error = %v, want nil", err)
 		}
 
