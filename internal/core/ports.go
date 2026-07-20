@@ -111,7 +111,13 @@ type ChainScanner interface {
 	// up front would filter unsupported transfers out before classification ever ran) and
 	// classified per log against tokenRegistry (keyed by lowercase contract address, Story
 	// 2.3's FR34 — a registry hit is an ordinary ObservedTransfer, a miss is an
-	// UnsupportedTokenObservation). The zero-amount guard applies to both branches.
+	// UnsupportedTokenObservation). The zero-amount guard applies to both branches. ETH
+	// reaching a known address via an internal CALL (a contract forwarding value,
+	// rather than a plain top-level transfer) is ALSO covered, but only best-effort: this
+	// relies on the configured RPC endpoint supporting debug_traceBlockByNumber, which
+	// varies by provider/chain and degrades gracefully (no error surfaced here, one warning
+	// logged, coverage silently narrowed to top-level + ERC-20 only) when unsupported — see
+	// internal/adapter/evm.Scanner.scanInternalTransfers.
 	ScanDeposits(ctx context.Context, knownAddresses []string, tokenRegistry map[string]Asset, fromBlock, toBlock uint64) ([]ObservedTransfer, []UnsupportedTokenObservation, error)
 }
 

@@ -339,7 +339,7 @@ func runWatcher(logger *slog.Logger, args []string) error {
 		return fmt.Errorf("upsert configured USDC address into token registry: %w", err)
 	}
 
-	scanner, err := evm.NewScanner(ctx, chain)
+	scanner, err := evm.NewScanner(ctx, chain, logger)
 	if err != nil {
 		return fmt.Errorf("connect chain scanner: %w", err)
 	}

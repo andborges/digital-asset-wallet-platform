@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"strings"
 
@@ -94,23 +95,72 @@ type rawBlock struct {
 	Transactions []rawBlockTransaction `json:"transactions"`
 }
 
+// callFrame is the callTracer JSON shape debug_traceBlockByNumber returns for one call (or
+// subcall) — matching go-ethereum's eth/tracers/native.callFrame's own JSON marshaling
+// (Type marshals as a plain string like "CALL"/"STATICCALL"/"CREATE"; Value may be omitted
+// or present as zero when the call carries no value — either way the != nil and Sign() > 0
+// guards in scanInternalTransfers filter it out safely). Only the fields
+// scanInternalTransfers actually needs are decoded — the same "decode just what's needed"
+// discipline as rawBlockTransaction above. Error is non-empty when this specific call
+// reverted, ran out of gas, or hit an invalid opcode (re-review 2026-07-20): the EVM rolls
+// back every state change made during such a call's execution, including any value it
+// transferred, so a frame with a non-empty Error — or a descendant of one — never actually
+// moved value and must never be recorded as a transfer.
+type callFrame struct {
+	Type  string          `json:"type"`
+	From  common.Address  `json:"from"`
+	To    *common.Address `json:"to"`
+	Value *hexutil.Big    `json:"value"`
+	Error string          `json:"error"`
+	Calls []callFrame     `json:"calls"`
+}
+
+// txCallTrace is one element of debug_traceBlockByNumber's callTracer response array — one
+// per transaction in the block. TxHash (go-ethereum's eth/tracers.txTraceResult, "txHash")
+// is what lets an internal transfer be attributed to the correct (chain, tx_hash) key
+// directly, without relying on the trace array's ordering matching rawBlock.Transactions'.
+// Error (re-review 2026-07-20) is non-empty when tracing THIS transaction itself failed
+// (independently of the rest of the block's trace succeeding) — Result is a zero value in
+// that case, not a real (empty) call tree, so it must be skipped rather than walked.
+type txCallTrace struct {
+	TxHash common.Hash `json:"txHash"`
+	Result callFrame   `json:"result"`
+	Error  string      `json:"error"`
+}
+
 // Scanner implements core.ChainScanner against one configured chain's RPC endpoint via
 // go-ethereum's ethclient — the chain adapter's boundary (AD-1): nothing outside
 // internal/adapter/evm imports go-ethereum or knows this chain's RPC details.
 type Scanner struct {
 	chain  Chain
 	client scanClient
+	logger *slog.Logger
+
+	// internalTraceDisabled is set once, permanently, the first time
+	// debug_traceBlockByNumber fails for any reason (unsupported method, quota error,
+	// malformed response) — and never cleared or retried for the rest of this Scanner
+	// instance's lifetime. Both observed failure modes (method not found; quota/tier
+	// gating) are permanent for the life of a given RPC configuration (Design Notes), so a
+	// watcher process restart — already the natural re-probe point per AD-2's one-OS-
+	// process-per-chain model — is what re-enables this pass, never an in-process retry.
+	// Unsynchronized: safe only because, like every other Scanner field, it is only ever
+	// read/written from the single goroutine that drives one Scanner instance's sequential
+	// poll loop (AD-2) — never call ScanDeposits on the same Scanner from two goroutines.
+	internalTraceDisabled bool
 }
 
 // NewScanner dials chain's RPC endpoint once and returns a core.ChainScanner bound to
 // it. One Scanner per configured chain, matching one watcher OS process per chain (AD-2).
-// Call Close when the watcher process shuts down.
-func NewScanner(ctx context.Context, chain Chain) (*Scanner, error) {
+// logger is used exclusively to log the one-time Warn when debug_traceBlockByNumber turns
+// out to be unsupported (see scanInternalTransfers) — every other Scanner method returns
+// its own errors to the caller instead of logging. Call Close when the watcher process
+// shuts down.
+func NewScanner(ctx context.Context, chain Chain, logger *slog.Logger) (*Scanner, error) {
 	client, err := ethclient.DialContext(ctx, chain.RPCURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s RPC %q: %w", chain.Name, chain.RPCURL, err)
 	}
-	return &Scanner{chain: chain, client: &scanClientImpl{ec: client}}, nil
+	return &Scanner{chain: chain, client: &scanClientImpl{ec: client}, logger: logger}, nil
 }
 
 // Close releases the underlying RPC connection.
@@ -212,6 +262,13 @@ func (s *Scanner) ScanDeposits(ctx context.Context, knownAddresses []string, tok
 // (production bug fix, 2026-07-17 — see scanClient's doc comment): BlockByNumber's typed
 // transaction decoding rejects Arbitrum/OP-stack-style transaction types that routinely
 // appear in ordinary blocks on both configured chains.
+//
+// In this same per-block loop, after the top-level tx.To()/tx.Value() pass below, this also
+// runs scanInternalTransfers — a second, best-effort pass over the SAME already-fetched
+// block for ETH that reached a known address via an internal CALL rather than a top-level
+// transfer (see scanInternalTransfers' doc comment). One debug_traceBlockByNumber call per
+// block, not per transaction, mirroring this function's own one eth_getBlockByNumber call
+// per block.
 func (s *Scanner) scanNativeTransfers(ctx context.Context, known map[common.Address]string, fromBlock, toBlock uint64) ([]core.ObservedTransfer, error) {
 	var transfers []core.ObservedTransfer
 
@@ -246,9 +303,123 @@ func (s *Scanner) scanNativeTransfers(ctx context.Context, known map[common.Addr
 				BlockHash: block.Hash.Hex(),
 			})
 		}
+
+		transfers = append(transfers, s.scanInternalTransfers(ctx, known, block, blockNum)...)
 	}
 
 	return transfers, nil
+}
+
+// scanInternalTransfers is the second, best-effort ETH-transfer detection pass this spec
+// adds: it walks each transaction's internal call tree (via debug_traceBlockByNumber's
+// callTracer) for CALL frames carrying value > 0 to a known deposit address — the case the
+// top-level tx.To()/tx.Value() scan above can never see, because the top-level tx itself has
+// to=<intermediary contract> and value=0 (e.g. an EIP-7702 smart-account redeemDelegations,
+// a multisig relay, any other contract-mediated send). The root frame of each tx's trace is
+// deliberately skipped: it is exactly what the top-level scan above already covers, so
+// walking it here too would double-count the same transfer. Only CALL is matched — not
+// CALLCODE (re-review 2026-07-20, Boundaries & Constraints): CALLCODE never actually moves
+// balance to `to`, it only executes `to`'s code in the caller's own storage context.
+//
+// A frame — or any of its ancestors — whose Error is non-empty reverted, ran out of gas, or
+// hit an invalid opcode; the EVM rolls back every state change from such a call, including
+// any value it appeared to transfer, so it must never be recorded (re-review 2026-07-20:
+// both the adversarial and edge-case review passes independently caught the initial
+// implementation crediting phantom deposits for reverted transfers). A tx whose own trace
+// itself failed (txCallTrace.Error non-empty, Result a zero value rather than a real empty
+// call tree) is skipped entirely rather than walked.
+//
+// This is intentionally best-effort and degrades gracefully: trace support varies by RPC
+// provider/chain (confirmed empirically — Base's public RPC supports
+// debug_traceBlockByNumber, Arbitrum's configured public RPC does not) and was never part
+// of Story 2.1's committed design. A failing/unsupported call is caught here — never
+// propagated to ScanDeposits' caller — logged exactly once via s.logger at Warn, and
+// permanently disables this pass for the rest of this Scanner instance's lifetime (no
+// retries; see internalTraceDisabled's doc comment). Top-level and ERC-20 detection are
+// completely unaffected by this failure, on both chains, regardless of trace support.
+//
+// Each matching frame gets a synthetic LogIndex of -2-dfsIndex, where dfsIndex is that
+// frame's pre-order depth-first index within its transaction's trace (starting at 0,
+// counting every non-root frame visited, not just matching ones) — deterministic and
+// unique within one (chain, tx_hash) on every re-scan, distinct from both
+// nativeTransferLogIndex (-1) and any real (always >= 0) ERC-20 log index.
+func (s *Scanner) scanInternalTransfers(ctx context.Context, known map[common.Address]string, block rawBlock, blockNum uint64) []core.ObservedTransfer {
+	if s.internalTraceDisabled || len(known) == 0 {
+		return nil
+	}
+
+	var traces []txCallTrace
+	// An explicit timeout (re-review 2026-07-20) bounds how long an unusually deep/expensive
+	// block's trace can run before the RPC node gives up, rather than relying entirely on
+	// whatever default that node happens to be configured with — reduces, though does not
+	// eliminate, the chance a single expensive block trips the permanent sticky-disable below
+	// for a reason that is not really "this endpoint can never trace" (deferred-work.md).
+	if err := s.client.CallContext(ctx, &traces, "debug_traceBlockByNumber", hexutil.EncodeUint64(blockNum), map[string]any{"tracer": "callTracer", "timeout": "10s"}); err != nil {
+		s.internalTraceDisabled = true
+		if s.logger != nil {
+			s.logger.Warn("debug_traceBlockByNumber failed — permanently disabling internal-transfer detection for this watcher process (top-level and ERC-20 detection are unaffected); restart the watcher to re-probe",
+				"chain", s.chain.Name, "block", blockNum, "error", err)
+		}
+		return nil
+	}
+
+	var transfers []core.ObservedTransfer
+	for _, trace := range traces {
+		if trace.Error != "" {
+			// Tracing this specific transaction failed independently of the rest of the
+			// block's trace succeeding — Result is a zero value, not a real empty call
+			// tree, so walking it would find nothing but for the wrong reason. Silently
+			// missing this tx's internal transfers (if any) is an accepted, narrow gap:
+			// escalating to Warn here, on every occurrence, on a call that already fires
+			// once per block, risks the exact log-spam this pass otherwise avoids.
+			continue
+		}
+
+		dfsIndex := 0
+		var walk func(frame callFrame, reverted bool)
+		walk = func(frame callFrame, reverted bool) {
+			for _, child := range frame.Calls {
+				idx := dfsIndex
+				dfsIndex++
+				childReverted := reverted || child.Error != ""
+
+				if !childReverted && child.Type == "CALL" && child.To != nil && child.Value != nil {
+					if addr, ok := known[*child.To]; ok {
+						value := (*big.Int)(child.Value)
+						if value.Sign() > 0 {
+							transfers = append(transfers, core.ObservedTransfer{
+								Chain:       core.Chain(s.chain.Name),
+								Asset:       core.AssetETH,
+								Address:     addr,
+								TxHash:      trace.TxHash.Hex(),
+								LogIndex:    -2 - idx,
+								Amount:      new(big.Int).Set(value),
+								BlockNumber: blockNum,
+								// BlockHash comes from the block already fetched by
+								// scanNativeTransfers above (Story 2.4) — never a second
+								// RPC round-trip just to learn a hash that call already has.
+								BlockHash: block.Hash.Hex(),
+							})
+						}
+					}
+				}
+
+				// Recurse regardless of this frame's own type, match outcome, or revert
+				// status: dfsIndex must stay identical across re-scans of the same trace
+				// (idempotency, AD-5) whether or not a given branch reverted or matched,
+				// and a STATICCALL/DELEGATECALL frame never itself carries a value
+				// transfer (Boundaries & Constraints) but code it executes can still make
+				// further CALL frames that do (e.g. a proxy delegating into an
+				// implementation that forwards ETH onward) — those must still be found,
+				// UNLESS this branch is already known-reverted, in which case nothing
+				// beneath it ever took effect either.
+				walk(child, childReverted)
+			}
+		}
+		walk(trace.Result, trace.Result.Error != "")
+	}
+
+	return transfers
 }
 
 // scanERC20Transfers finds every ERC-20 Transfer event landing on a known deposit
