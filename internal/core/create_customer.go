@@ -52,19 +52,28 @@ func (uc *CreateCustomer) Execute(ctx context.Context) (Customer, error) {
 		DepositAddress: depositAddress,
 	}
 
-	accounts := make([]Account, 0, len(SupportedChainAssetPairs))
+	// Two accounts per supported (chain, asset) pair — available and hold (Story 3.2) —
+	// provisioned atomically for every new customer, exactly like this use case already
+	// provisions the 4 SupportedChainAssetPairs themselves. A withdrawal's hold has
+	// somewhere to land the instant it is requested; there is no lazy "create the hold
+	// account on first use" path.
+	accountTypes := []AccountType{AccountTypeAvailable, AccountTypeHold}
+	accounts := make([]Account, 0, len(SupportedChainAssetPairs)*len(accountTypes))
 	for _, pair := range SupportedChainAssetPairs {
-		accountID, err := newUUIDv7()
-		if err != nil {
-			return Customer{}, fmt.Errorf("generate account id: %w", err)
+		for _, accountType := range accountTypes {
+			accountID, err := newUUIDv7()
+			if err != nil {
+				return Customer{}, fmt.Errorf("generate account id: %w", err)
+			}
+			accounts = append(accounts, Account{
+				ID:         accountID,
+				CustomerID: customer.ID,
+				Chain:      pair.Chain,
+				Asset:      pair.Asset,
+				Type:       accountType,
+				CreatedAt:  now,
+			})
 		}
-		accounts = append(accounts, Account{
-			ID:         accountID,
-			CustomerID: customer.ID,
-			Chain:      pair.Chain,
-			Asset:      pair.Asset,
-			CreatedAt:  now,
-		})
 	}
 
 	if err := uc.repo.CreateCustomer(ctx, customer, accounts, depositAddress); err != nil {

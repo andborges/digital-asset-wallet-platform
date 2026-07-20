@@ -312,8 +312,8 @@ func (r *DepositRepository) CreditFinalizedDeposits(ctx context.Context, chain c
 		 FROM deposits d
 		 JOIN deposit_addresses da ON da.address = d.address
 		 JOIN crediting_policy cp ON cp.chain = d.chain AND cp.asset = d.asset
-		 JOIN accounts cust ON cust.customer_id = da.customer_id AND cust.chain = d.chain AND cust.asset = d.asset
-		 JOIN accounts float ON float.customer_id IS NULL AND float.chain = d.chain AND float.asset = d.asset
+		 JOIN accounts cust ON cust.customer_id = da.customer_id AND cust.chain = d.chain AND cust.asset = d.asset AND cust.account_type = 'available'
+		 JOIN accounts float ON float.customer_id IS NULL AND float.chain = d.chain AND float.asset = d.asset AND float.account_type = 'available'
 		 WHERE d.chain = $1 AND d.state = $2 AND cp.credit_tier = $3
 		 ORDER BY d.block_number
 		 LIMIT $4`,

@@ -11,9 +11,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,8 +94,30 @@ func newTestHandler(t *testing.T) testEnv {
 	getDeposits := core.NewGetCustomerDeposits(depositReader)
 	unsupportedTokenRepo := postgres.NewUnsupportedTokenRepository(pool)
 	listUnsupportedTokenObservations := core.NewListUnsupportedTokenObservations(unsupportedTokenRepo)
+	// Story 3.1: a fake FeeEstimator, not a real evm.FeeEstimator — this end-to-end test
+	// proves the HTTP wiring (query-param validation, response shape, auth), not chain
+	// RPC behavior, which fee_estimator_test.go already covers against fakes/canned
+	// responses. No real RPC round-trip is needed or wanted here. Story 3.3's
+	// CreateWithdrawal shares this SAME fake instance (as the core.FeeEstimator port, not
+	// the core.EstimateFee use case) — its own fee-inclusive balance check needs the
+	// identical fixed TotalFee this test's fixtures are sized around.
+	feeEstimator := &fakeFeeEstimator{
+		result: core.FeeEstimate{L2Fee: big.NewInt(1000), L1Fee: big.NewInt(500), TotalFee: big.NewInt(1500)},
+	}
+	estimateFee := core.NewEstimateFee(feeEstimator)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+	// Story 3.3: a fake WithdrawalThresholdLister with one fixed threshold for every
+	// (chain, asset) — this end-to-end test proves the HTTP wiring and routing outcomes,
+	// not the real withdrawal_approval_thresholds table (withdrawal_threshold_lister_test.go
+	// already covers that against a real Postgres container). Every withdrawal amount used
+	// below this threshold routes to "approved"; a dedicated test case uses an amount above
+	// it to exercise "awaiting-approval".
+	withdrawalThresholdLister := &fakeWithdrawalThresholdLister{threshold: big.NewInt(5000)}
+	createWithdrawal := core.NewCreateWithdrawal(withdrawalRepo, feeEstimator, withdrawalThresholdLister)
+	approveWithdrawal := core.NewApproveWithdrawal(withdrawalRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions, getDeposits, listUnsupportedTokenObservations)
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions, getDeposits, listUnsupportedTokenObservations, estimateFee, createWithdrawal, approveWithdrawal, testLogger)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
@@ -114,9 +140,13 @@ func creditAccount(t *testing.T, env testEnv, customerID, chain, asset, amount s
 	t.Helper()
 	ctx := context.Background()
 
+	// account_type = 'available' (Story 3.2): since that story, every customer has TWO
+	// accounts per (chain, asset) — available and hold — so an unscoped lookup here would
+	// match both rows and nondeterministically credit whichever QueryRow happened to
+	// return first. This fixture always means "fund the customer's spendable balance."
 	var accountID string
 	if err := env.pool.QueryRow(ctx,
-		`SELECT id FROM accounts WHERE customer_id = $1 AND chain = $2 AND asset = $3`,
+		`SELECT id FROM accounts WHERE customer_id = $1 AND chain = $2 AND asset = $3 AND account_type = 'available'`,
 		customerID, chain, asset,
 	).Scan(&accountID); err != nil {
 		t.Fatalf("look up account (%s, %s) for credit fixture: %v", chain, asset, err)
@@ -256,7 +286,7 @@ func TestGetCustomerBalances_EndToEnd(t *testing.T) {
 
 		var accountID string
 		if err := env.pool.QueryRow(ctx,
-			`SELECT id FROM accounts WHERE customer_id = $1 AND chain = 'base' AND asset = 'eth'`,
+			`SELECT id FROM accounts WHERE customer_id = $1 AND chain = 'base' AND asset = 'eth' AND account_type = 'available'`,
 			customerID,
 		).Scan(&accountID); err != nil {
 			t.Fatalf("look up test account: %v", err)
@@ -326,7 +356,7 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 	env := newTestHandler(t)
 	handler := env.handler
 
-	t.Run("AC1 & AC4: creates a customer with exactly four provisioned accounts, atomically", func(t *testing.T) {
+	t.Run("AC1 & AC4: creates a customer with exactly eight provisioned accounts (available + hold per pair), atomically", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/customers", strings.NewReader("{}"))
 		req.Header.Set("Authorization", "Bearer test-token")
 		req.Header.Set("Idempotency-Key", "e2e-key-1")
@@ -350,8 +380,9 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 		assertWellFormedDepositAddress(t, body.DepositAddress)
 
 		// AC4: verify directly against Postgres — not just the HTTP response — that the
-		// customer and all four accounts exist as a single fait accompli, one insert
-		// each, no partial state. AC1: verify the exact (chain, asset) pairs.
+		// customer and all eight accounts exist as a single fait accompli, one insert
+		// each, no partial state. AC1: verify the exact (chain, asset, account_type)
+		// triples (Story 3.2: available + hold per pair, 4 pairs x 2 types = 8).
 		ctx := context.Background()
 		var customerCount int
 		if err := env.pool.QueryRow(ctx, `SELECT count(*) FROM customers WHERE id = $1`, body.ID).Scan(&customerCount); err != nil {
@@ -361,26 +392,31 @@ func TestCreateCustomer_EndToEnd(t *testing.T) {
 			t.Fatalf("customers row count = %d, want 1", customerCount)
 		}
 
-		rows, err := env.pool.Query(ctx, `SELECT chain, asset FROM accounts WHERE customer_id = $1 ORDER BY chain, asset`, body.ID)
+		rows, err := env.pool.Query(ctx, `SELECT chain, asset, account_type FROM accounts WHERE customer_id = $1 ORDER BY chain, asset, account_type`, body.ID)
 		if err != nil {
 			t.Fatalf("query accounts: %v", err)
 		}
 		defer rows.Close()
-		var pairs []string
+		var triples []string
 		for rows.Next() {
-			var chain, asset string
-			if err := rows.Scan(&chain, &asset); err != nil {
+			var chain, asset, accountType string
+			if err := rows.Scan(&chain, &asset, &accountType); err != nil {
 				t.Fatalf("scan account row: %v", err)
 			}
-			pairs = append(pairs, chain+"/"+asset)
+			triples = append(triples, chain+"/"+asset+"/"+accountType)
 		}
-		want := []string{"arbitrum/eth", "arbitrum/usdc", "base/eth", "base/usdc"}
-		if len(pairs) != len(want) {
-			t.Fatalf("provisioned accounts = %v, want exactly %v", pairs, want)
+		want := []string{
+			"arbitrum/eth/available", "arbitrum/eth/hold",
+			"arbitrum/usdc/available", "arbitrum/usdc/hold",
+			"base/eth/available", "base/eth/hold",
+			"base/usdc/available", "base/usdc/hold",
+		}
+		if len(triples) != len(want) {
+			t.Fatalf("provisioned accounts = %v, want exactly %v", triples, want)
 		}
 		for i, w := range want {
-			if pairs[i] != w {
-				t.Fatalf("provisioned accounts = %v, want %v", pairs, want)
+			if triples[i] != w {
+				t.Fatalf("provisioned accounts = %v, want %v", triples, want)
 			}
 		}
 
@@ -742,6 +778,621 @@ func TestCreateTransfer_EndToEnd(t *testing.T) {
 		rec2 := postTransfer(t, env, "transfer-e2e-key-9b", source, dest, "base", "btc", "1")
 		if rec2.Code != http.StatusBadRequest {
 			t.Fatalf("invalid asset: status = %d, want %d, body = %s", rec2.Code, http.StatusBadRequest, rec2.Body.String())
+		}
+	})
+}
+
+// postWithdrawal issues a POST /v1/withdrawals request with the given fields and returns
+// the recorded response. An empty idempotencyKey omits the header entirely (mirrors
+// postTransfer's identical convention).
+func postWithdrawal(t *testing.T, env testEnv, idempotencyKey, customerID, chain, asset, amount, destinationAddress string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := fmt.Sprintf(
+		`{"customerId":%q,"chain":%q,"asset":%q,"amount":%q,"destinationAddress":%q}`,
+		customerID, chain, asset, amount, destinationAddress,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/v1/withdrawals", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// validDestinationAddress is a structurally well-formed 0x-prefixed 40-hex-character
+// address, used throughout the withdrawal tests below — Story 3.2 validates shape only,
+// never a real on-chain destination.
+const validDestinationAddress = "0x00000000000000000000000000000000000000AA"
+
+func TestCreateWithdrawal_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("AC1: a valid withdrawal places a hold, then auto-approves — available debited, hold credited, status approved", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-1")
+		// 2000 covers the withdrawn 400 PLUS the fixed 1500 fee estimate this test env's
+		// fakeFeeEstimator returns (Story 3.3's fee-inclusive balance check), with headroom
+		// to spare.
+		creditAccount(t, env, customerID, "base", "eth", "2000")
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-1", customerID, "base", "eth", "400", validDestinationAddress)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+		}
+
+		var body struct {
+			ID                 string `json:"id"`
+			CustomerID         string `json:"customerId"`
+			Chain              string `json:"chain"`
+			Asset              string `json:"asset"`
+			Amount             string `json:"amount"`
+			DestinationAddress string `json:"destinationAddress"`
+			Status             string `json:"status"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if body.ID == "" {
+			t.Fatal("expected a non-empty withdrawal id")
+		}
+		if body.CustomerID != customerID {
+			t.Fatalf("customerId = %q, want %q", body.CustomerID, customerID)
+		}
+		if body.Amount != "400" {
+			t.Fatalf("amount = %q, want %q", body.Amount, "400")
+		}
+		if body.DestinationAddress != validDestinationAddress {
+			t.Fatalf("destinationAddress = %q, want %q", body.DestinationAddress, validDestinationAddress)
+		}
+		// 400 is below this test env's fixed 5000 threshold (Story 3.3), so this withdrawal
+		// auto-approves in the same request — no operator action needed.
+		if body.Status != "approved" {
+			t.Fatalf("status = %q, want %q", body.Status, "approved")
+		}
+
+		// The customer's visible (available) balance is decreased by the withdrawn
+		// amount — the Manual Checks section of Story 3.2's own spec calls this out
+		// explicitly as the observable effect of a successful withdrawal.
+		assertBalance(t, env, customerID, "base", "eth", "1600")
+
+		// The hold account itself is not exposed by any endpoint yet (Story 3.2 scope),
+		// so it is verified directly against Postgres.
+		var holdBalanceText string
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT COALESCE(SUM(p.amount), 0)::text
+			 FROM accounts a LEFT JOIN postings p ON p.account_id = a.id
+			 WHERE a.customer_id = $1 AND a.chain = 'base' AND a.asset = 'eth' AND a.account_type = 'hold'`,
+			customerID,
+		).Scan(&holdBalanceText); err != nil {
+			t.Fatalf("query hold balance: %v", err)
+		}
+		if holdBalanceText != "400" {
+			t.Fatalf("hold balance = %q, want %q", holdBalanceText, "400")
+		}
+
+		// Exactly one withdrawal_hold journal entry, with exactly two postings, exists.
+		var journalCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM journal_entries WHERE cause_type = 'withdrawal_hold' AND cause_id = $1`,
+			"withdrawal-e2e-key-1",
+		).Scan(&journalCount); err != nil {
+			t.Fatalf("query journal_entries: %v", err)
+		}
+		if journalCount != 1 {
+			t.Fatalf("withdrawal_hold journal entries for key = %d, want exactly 1", journalCount)
+		}
+
+		var withdrawalRowCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM withdrawals WHERE id = $1`, body.ID,
+		).Scan(&withdrawalRowCount); err != nil {
+			t.Fatalf("query withdrawals: %v", err)
+		}
+		if withdrawalRowCount != 1 {
+			t.Fatalf("withdrawals row count for id %s = %d, want 1", body.ID, withdrawalRowCount)
+		}
+
+		// A paired "withdrawal.approved" outbox event was written in the same
+		// transaction (AD-4) — Story 3.2's own "withdrawal.created" event is no longer
+		// written by this story's CreateWithdrawal (Design Notes).
+		var outboxCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM outbox_events WHERE event_type = 'withdrawal.approved' AND payload->>'withdrawalId' = $1`,
+			body.ID,
+		).Scan(&outboxCount); err != nil {
+			t.Fatalf("query outbox_events: %v", err)
+		}
+		if outboxCount != 1 {
+			t.Fatalf("withdrawal.approved outbox events for withdrawal %s = %d, want exactly 1", body.ID, outboxCount)
+		}
+	})
+
+	t.Run("AC2: replaying the same Idempotency-Key with an identical body places exactly one hold", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-2")
+		creditAccount(t, env, customerID, "base", "eth", "2000")
+
+		key := "withdrawal-e2e-key-2"
+		rec1 := postWithdrawal(t, env, key, customerID, "base", "eth", "250", validDestinationAddress)
+		if rec1.Code != http.StatusCreated {
+			t.Fatalf("first request status = %d, want %d, body = %s", rec1.Code, http.StatusCreated, rec1.Body.String())
+		}
+
+		rec2 := postWithdrawal(t, env, key, customerID, "base", "eth", "250", validDestinationAddress)
+		if rec2.Code != rec1.Code || rec2.Body.String() != rec1.Body.String() {
+			t.Fatalf("replay status/body = %d/%q, want byte-for-byte match with original %d/%q",
+				rec2.Code, rec2.Body.String(), rec1.Code, rec1.Body.String())
+		}
+
+		assertBalance(t, env, customerID, "base", "eth", "1750")
+
+		var journalCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM journal_entries WHERE cause_type = 'withdrawal_hold' AND cause_id = $1`,
+			key,
+		).Scan(&journalCount); err != nil {
+			t.Fatalf("query journal_entries: %v", err)
+		}
+		if journalCount != 1 {
+			t.Fatalf("withdrawal_hold journal entries for key %q = %d, want exactly 1 (no second hold)", key, journalCount)
+		}
+
+		var withdrawalCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM withdrawals WHERE customer_id = $1`, customerID,
+		).Scan(&withdrawalCount); err != nil {
+			t.Fatalf("query withdrawals: %v", err)
+		}
+		if withdrawalCount != 1 {
+			t.Fatalf("withdrawals row count = %d, want exactly 1 (no duplicate row on replay)", withdrawalCount)
+		}
+	})
+
+	t.Run("AC3: replaying the same Idempotency-Key with a different body is rejected with 409", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-3")
+		creditAccount(t, env, customerID, "base", "eth", "2000")
+
+		key := "withdrawal-e2e-key-3"
+		rec1 := postWithdrawal(t, env, key, customerID, "base", "eth", "100", validDestinationAddress)
+		if rec1.Code != http.StatusCreated {
+			t.Fatalf("first request status = %d, want %d, body = %s", rec1.Code, http.StatusCreated, rec1.Body.String())
+		}
+
+		rec2 := postWithdrawal(t, env, key, customerID, "base", "eth", "200", validDestinationAddress)
+		if rec2.Code != http.StatusConflict {
+			t.Fatalf("different-body replay status = %d, want %d, body = %s", rec2.Code, http.StatusConflict, rec2.Body.String())
+		}
+	})
+
+	t.Run("insufficient available balance is rejected with 422 and places no hold", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-4")
+		creditAccount(t, env, customerID, "base", "eth", "100")
+
+		beforeCount := postingsCount(t, env)
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-4", customerID, "base", "eth", "101", validDestinationAddress)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+		}
+
+		if got := postingsCount(t, env); got != beforeCount {
+			t.Fatalf("postings count = %d, want unchanged %d (no hold placed)", got, beforeCount)
+		}
+		assertBalance(t, env, customerID, "base", "eth", "100")
+	})
+
+	t.Run("non-positive or missing amount is rejected with 400", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-5")
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-5a", customerID, "base", "eth", "0", validDestinationAddress)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("zero amount: status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		rec2 := postWithdrawal(t, env, "withdrawal-e2e-key-5b", customerID, "base", "eth", "-1", validDestinationAddress)
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("negative amount: status = %d, want %d, body = %s", rec2.Code, http.StatusBadRequest, rec2.Body.String())
+		}
+	})
+
+	t.Run("malformed destination address is rejected with 400", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-6")
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-6", customerID, "base", "eth", "1", "not-an-address")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("unknown customer returns 404", func(t *testing.T) {
+		unknown := uuid.New().String()
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-7", unknown, "base", "eth", "1", validDestinationAddress)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+	})
+
+	t.Run("invalid chain or asset enum is rejected with 400, not 404", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-8")
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-8a", customerID, "polygon", "eth", "1", validDestinationAddress)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("invalid chain: status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		rec2 := postWithdrawal(t, env, "withdrawal-e2e-key-8b", customerID, "base", "btc", "1", validDestinationAddress)
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("invalid asset: status = %d, want %d, body = %s", rec2.Code, http.StatusBadRequest, rec2.Body.String())
+		}
+	})
+
+	t.Run("missing Idempotency-Key is rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-9")
+
+		rec := postWithdrawal(t, env, "", customerID, "base", "eth", "1", validDestinationAddress)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("missing bearer token is rejected", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-10")
+
+		body := fmt.Sprintf(`{"customerId":%q,"chain":"base","asset":"eth","amount":"1","destinationAddress":%q}`, customerID, validDestinationAddress)
+		req := httptest.NewRequest(http.MethodPost, "/v1/withdrawals", strings.NewReader(body))
+		req.Header.Set("Idempotency-Key", "withdrawal-e2e-key-10")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("concurrent withdrawal requests for the same customer/chain/asset never lose an update", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-concurrent-1")
+		creditAccount(t, env, customerID, "base", "eth", "10000")
+
+		const numRequests = 10
+		results := make([]*httptest.ResponseRecorder, numRequests)
+		var wg sync.WaitGroup
+		for i := 0; i < numRequests; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				results[i] = postWithdrawal(t, env, fmt.Sprintf("withdrawal-e2e-concurrent-key-%d", i), customerID, "base", "eth", "10", validDestinationAddress)
+			}(i)
+		}
+		wg.Wait()
+
+		for i, rec := range results {
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("concurrent withdrawal %d status = %d, want %d, body = %s", i, rec.Code, http.StatusCreated, rec.Body.String())
+			}
+		}
+
+		assertBalance(t, env, customerID, "base", "eth", "9900")
+
+		var withdrawalCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM withdrawals WHERE customer_id = $1`, customerID,
+		).Scan(&withdrawalCount); err != nil {
+			t.Fatalf("query withdrawals: %v", err)
+		}
+		if withdrawalCount != numRequests {
+			t.Fatalf("withdrawals row count = %d, want %d (no lost update)", withdrawalCount, numRequests)
+		}
+	})
+
+	t.Run("amount exceeding a uint256's maximum is rejected with 400", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-11")
+		creditAccount(t, env, customerID, "base", "eth", "1000")
+
+		tooLarge := new(big.Int).Lsh(big.NewInt(1), 256) // 2^256, one past uint256's max
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-11", customerID, "base", "eth", tooLarge.String(), validDestinationAddress)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("a withdrawal hold appears exactly once in the customer's transaction history, not twice", func(t *testing.T) {
+		// Regression test (adversarial review): a withdrawal hold's journal entry posts to
+		// this customer's OWN available and hold accounts in one entry. Before the
+		// account_type filter was added to transaction_repo.go's query, that single entry
+		// surfaced as two rows (one per posting) sharing the same id with opposite-signed
+		// amounts, since — unlike an internal transfer — both legs belong to this customer.
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-12")
+		creditAccount(t, env, customerID, "base", "eth", "2000")
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-12", customerID, "base", "eth", "300", validDestinationAddress)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+		}
+
+		txRec := getTransactions(t, env, customerID, "")
+		if txRec.Code != http.StatusOK {
+			t.Fatalf("transactions status = %d, want %d, body = %s", txRec.Code, http.StatusOK, txRec.Body.String())
+		}
+		var body transactionsResponseBody
+		if err := json.Unmarshal(txRec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode transactions response: %v", err)
+		}
+		// Two transactions are expected in total: creditAccount's own "test_fixture" entry
+		// (funding the customer's available balance) and the withdrawal hold — each a
+		// DISTINCT journal entry. What this test guards against is the withdrawal hold's
+		// single journal entry (which posts to this customer's own available AND hold
+		// accounts) contributing TWO rows instead of one.
+		var withdrawalHoldRows []string
+		for _, txn := range body.Transactions {
+			if txn.Type == "withdrawal_hold" {
+				withdrawalHoldRows = append(withdrawalHoldRows, txn.Amount)
+			}
+		}
+		if len(withdrawalHoldRows) != 1 {
+			t.Fatalf("withdrawal_hold transaction rows = %d, want exactly 1 (the hold-account's mirrored posting must not also appear): %+v", len(withdrawalHoldRows), body.Transactions)
+		}
+		if withdrawalHoldRows[0] != "-300" {
+			t.Fatalf("withdrawal_hold transaction amount = %q, want %q (the available account's debit)", withdrawalHoldRows[0], "-300")
+		}
+	})
+
+	t.Run("Story 3.3: a withdrawal above the threshold routes to awaiting-approval, with an approval.required outbox event", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-13")
+		// 20000 comfortably covers 6000 (above this test env's fixed 5000 threshold) plus
+		// the fixed 1500 fee estimate.
+		creditAccount(t, env, customerID, "base", "eth", "20000")
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-13", customerID, "base", "eth", "6000", validDestinationAddress)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+		}
+
+		var body struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if body.Status != "awaiting-approval" {
+			t.Fatalf("status = %q, want %q", body.Status, "awaiting-approval")
+		}
+
+		// The hold is still placed even though the withdrawal now waits for approval —
+		// Story 3.3 never re-validates or re-places the hold, it only reads the resulting
+		// balance.
+		assertBalance(t, env, customerID, "base", "eth", "14000")
+
+		if got := outboxEventCountForWithdrawal(t, env, "approval.required", body.ID); got != 1 {
+			t.Fatalf("approval.required outbox events = %d, want exactly 1", got)
+		}
+		if got := outboxEventCountForWithdrawal(t, env, "withdrawal.approved", body.ID); got != 0 {
+			t.Fatalf("withdrawal.approved outbox events = %d, want 0 (not yet approved)", got)
+		}
+	})
+
+	t.Run("Story 3.3: the zero address is rejected with 400 before any hold is placed", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-14")
+		creditAccount(t, env, customerID, "base", "eth", "2000")
+
+		beforeCount := postingsCount(t, env)
+
+		zeroAddress := "0x0000000000000000000000000000000000000000"
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-14", customerID, "base", "eth", "400", zeroAddress)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		if got := postingsCount(t, env); got != beforeCount {
+			t.Fatalf("postings count = %d, want unchanged %d (no hold placed for a denylisted destination)", got, beforeCount)
+		}
+		assertBalance(t, env, customerID, "base", "eth", "2000")
+	})
+
+	t.Run("Story 3.3: available balance covers the amount but not the estimated fee is rejected with 422 and places no hold", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "withdrawal-e2e-source-15")
+		// Covers the withdrawn 100 comfortably, but nowhere near 100 + the fixed 1500 fee
+		// estimate: post-hold available would be only 1, far short of 1500.
+		creditAccount(t, env, customerID, "base", "eth", "101")
+
+		beforeCount := postingsCount(t, env)
+
+		rec := postWithdrawal(t, env, "withdrawal-e2e-key-15", customerID, "base", "eth", "100", validDestinationAddress)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+		}
+
+		// The whole request transaction rolled back — no partial write, not even the hold
+		// itself (Story 3.3 I/O matrix: "hold is NOT committed").
+		if got := postingsCount(t, env); got != beforeCount {
+			t.Fatalf("postings count = %d, want unchanged %d (no hold placed on a fee-rejected request)", got, beforeCount)
+		}
+		assertBalance(t, env, customerID, "base", "eth", "101")
+
+		var withdrawalCount int
+		if err := env.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM withdrawals WHERE customer_id = $1`, customerID,
+		).Scan(&withdrawalCount); err != nil {
+			t.Fatalf("query withdrawals: %v", err)
+		}
+		if withdrawalCount != 0 {
+			t.Fatalf("withdrawals row count = %d, want 0 (no partial write)", withdrawalCount)
+		}
+	})
+}
+
+// outboxEventCountForWithdrawal returns how many outbox_events rows of eventType carry
+// withdrawalID in their jsonb payload.
+func outboxEventCountForWithdrawal(t *testing.T, env testEnv, eventType, withdrawalID string) int {
+	t.Helper()
+	var count int
+	if err := env.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM outbox_events WHERE event_type = $1 AND payload->>'withdrawalId' = $2`,
+		eventType, withdrawalID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count %s outbox events: %v", eventType, err)
+	}
+	return count
+}
+
+// postApproveWithdrawal issues a POST /v1/withdrawals/{id}/approve request and returns
+// the recorded response. An empty idempotencyKey omits the header entirely (mirrors
+// postWithdrawal's identical convention); bearer likewise omits the Authorization header
+// when false.
+func postApproveWithdrawal(t *testing.T, env testEnv, idempotencyKey, withdrawalID, actor, reason string, bearer bool) *httptest.ResponseRecorder {
+	t.Helper()
+	body := fmt.Sprintf(`{"actor":%q,"reason":%q}`, actor, reason)
+	req := httptest.NewRequest(http.MethodPost, "/v1/withdrawals/"+withdrawalID+"/approve", strings.NewReader(body))
+	if bearer {
+		req.Header.Set("Authorization", "Bearer test-token")
+	}
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// createAwaitingApprovalWithdrawalViaHTTP creates a customer, funds it, and posts a
+// withdrawal whose amount exceeds this test env's fixed 5000 threshold — routing it to
+// awaiting-approval — through the real HTTP stack, returning its id.
+func createAwaitingApprovalWithdrawalViaHTTP(t *testing.T, env testEnv, idempotencyKeyPrefix string) string {
+	t.Helper()
+	customerID := createTestCustomer(t, env, idempotencyKeyPrefix+"-customer")
+	creditAccount(t, env, customerID, "base", "eth", "20000")
+
+	rec := postWithdrawal(t, env, idempotencyKeyPrefix+"-withdrawal", customerID, "base", "eth", "6000", validDestinationAddress)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create awaiting-approval withdrawal fixture: status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode create-withdrawal response: %v", err)
+	}
+	return body.ID
+}
+
+// TestApproveWithdrawal_EndToEnd exercises Story 3.3's POST /v1/withdrawals/{id}/approve
+// endpoint over the real, wired HTTP stack — the full status matrix (200/404/409/400) plus
+// the auth/idempotency guards every other mutating route already has.
+func TestApproveWithdrawal_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("200: an operator approves an awaiting-approval withdrawal, with audit columns and outbox event", func(t *testing.T) {
+		withdrawalID := createAwaitingApprovalWithdrawalViaHTTP(t, env, "approve-e2e-1")
+
+		rec := postApproveWithdrawal(t, env, "approve-e2e-key-1", withdrawalID, "ops-alice", "manually reviewed, looks fine", true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var body struct {
+			ID             string  `json:"id"`
+			Status         string  `json:"status"`
+			ApprovedAt     *string `json:"approvedAt"`
+			ApprovedBy     *string `json:"approvedBy"`
+			ApprovalReason *string `json:"approvalReason"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if body.Status != "approved" {
+			t.Fatalf("status = %q, want %q", body.Status, "approved")
+		}
+		if body.ApprovedAt == nil || *body.ApprovedAt == "" {
+			t.Fatal("expected a non-empty approvedAt")
+		}
+		if body.ApprovedBy == nil || *body.ApprovedBy != "ops-alice" {
+			t.Fatalf("approvedBy = %v, want %q", body.ApprovedBy, "ops-alice")
+		}
+		if body.ApprovalReason == nil || *body.ApprovalReason != "manually reviewed, looks fine" {
+			t.Fatalf("approvalReason = %v, want %q", body.ApprovalReason, "manually reviewed, looks fine")
+		}
+
+		if got := outboxEventCountForWithdrawal(t, env, "withdrawal.approved", withdrawalID); got != 1 {
+			t.Fatalf("withdrawal.approved outbox events = %d, want exactly 1", got)
+		}
+	})
+
+	t.Run("404: approving an unknown withdrawal id", func(t *testing.T) {
+		unknown := uuid.New().String()
+		rec := postApproveWithdrawal(t, env, "approve-e2e-key-2", unknown, "ops-alice", "reason", true)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		}
+	})
+
+	t.Run("409: approving a withdrawal that is not awaiting approval (already approved)", func(t *testing.T) {
+		withdrawalID := createAwaitingApprovalWithdrawalViaHTTP(t, env, "approve-e2e-3")
+
+		rec1 := postApproveWithdrawal(t, env, "approve-e2e-key-3a", withdrawalID, "ops-alice", "first approval", true)
+		if rec1.Code != http.StatusOK {
+			t.Fatalf("first approve: status = %d, want %d, body = %s", rec1.Code, http.StatusOK, rec1.Body.String())
+		}
+
+		rec2 := postApproveWithdrawal(t, env, "approve-e2e-key-3b", withdrawalID, "ops-bob", "second approval attempt", true)
+		if rec2.Code != http.StatusConflict {
+			t.Fatalf("second approve: status = %d, want %d, body = %s", rec2.Code, http.StatusConflict, rec2.Body.String())
+		}
+	})
+
+	t.Run("409: approving a withdrawal that is still below-threshold approved (never entered awaiting-approval)", func(t *testing.T) {
+		customerID := createTestCustomer(t, env, "approve-e2e-4-customer")
+		creditAccount(t, env, customerID, "base", "eth", "2000")
+		rec := postWithdrawal(t, env, "approve-e2e-4-withdrawal", customerID, "base", "eth", "400", validDestinationAddress)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create withdrawal: status = %d, want %d, body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode create-withdrawal response: %v", err)
+		}
+
+		approveRec := postApproveWithdrawal(t, env, "approve-e2e-key-4", body.ID, "ops-alice", "reason", true)
+		if approveRec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want %d, body = %s", approveRec.Code, http.StatusConflict, approveRec.Body.String())
+		}
+	})
+
+	t.Run("400: missing actor is rejected", func(t *testing.T) {
+		withdrawalID := createAwaitingApprovalWithdrawalViaHTTP(t, env, "approve-e2e-5")
+
+		rec := postApproveWithdrawal(t, env, "approve-e2e-key-5", withdrawalID, "", "reason", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("400: missing reason is rejected", func(t *testing.T) {
+		withdrawalID := createAwaitingApprovalWithdrawalViaHTTP(t, env, "approve-e2e-6")
+
+		rec := postApproveWithdrawal(t, env, "approve-e2e-key-6", withdrawalID, "ops-alice", "", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("missing Idempotency-Key is rejected", func(t *testing.T) {
+		withdrawalID := createAwaitingApprovalWithdrawalViaHTTP(t, env, "approve-e2e-7")
+
+		rec := postApproveWithdrawal(t, env, "", withdrawalID, "ops-alice", "reason", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("missing bearer token is rejected", func(t *testing.T) {
+		withdrawalID := createAwaitingApprovalWithdrawalViaHTTP(t, env, "approve-e2e-8")
+
+		rec := postApproveWithdrawal(t, env, "approve-e2e-key-8", withdrawalID, "ops-alice", "reason", false)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 		}
 	})
 }
@@ -1552,6 +2203,38 @@ func (s *fakeReorgScanner) ScanDeposits(ctx context.Context, knownAddresses []st
 
 var _ core.ChainScanner = (*fakeReorgScanner)(nil)
 
+// fakeFeeEstimator is a minimal core.FeeEstimator test double used by
+// TestGetWithdrawalFeeEstimate_EndToEnd — this end-to-end test proves the HTTP wiring
+// (query-param validation, response shape, auth) over the real stack, not chain RPC
+// behavior, which fee_estimator_test.go already covers against fakes/canned responses in
+// internal/adapter/evm. No real RPC call is needed or wanted here.
+type fakeFeeEstimator struct {
+	result core.FeeEstimate
+	err    error
+}
+
+func (f *fakeFeeEstimator) EstimateFee(_ context.Context, _ core.Chain, _ core.Asset, _ *big.Int) (core.FeeEstimate, error) {
+	return f.result, f.err
+}
+
+var _ core.FeeEstimator = (*fakeFeeEstimator)(nil)
+
+// fakeWithdrawalThresholdLister is a minimal core.WithdrawalThresholdLister test double
+// used by TestCreateWithdrawal_EndToEnd (Story 3.3) — one fixed threshold for every
+// (chain, asset), mirroring fakeFeeEstimator's own "prove the HTTP wiring, not the real
+// adapter" reasoning; withdrawal_threshold_lister_test.go already covers the real table
+// against a real Postgres container.
+type fakeWithdrawalThresholdLister struct {
+	threshold *big.Int
+	err       error
+}
+
+func (f *fakeWithdrawalThresholdLister) GetApprovalThreshold(_ context.Context, _ core.Chain, _ core.Asset) (*big.Int, error) {
+	return f.threshold, f.err
+}
+
+var _ core.WithdrawalThresholdLister = (*fakeWithdrawalThresholdLister)(nil)
+
 // TestReorgDetection_EndToEnd exercises Story 2.4's reorg-detection path against real
 // Postgres: core.NewTrackDeposits is driven directly (mirroring
 // TestCreditFinalizedDeposits_EndToEnd's pattern of invoking a use case against the test
@@ -1806,6 +2489,146 @@ func TestGetUnsupportedTokenObservations_EndToEnd(t *testing.T) {
 		)
 		if err == nil {
 			t.Fatal("expected inserting an unrecognized asset into token_registry to fail its CHECK constraint, got nil error")
+		}
+	})
+}
+
+// getWithdrawalFeeEstimate issues a GET /v1/withdrawals/fee-estimate request with the
+// given raw query string and returns the recorded response. bearer controls whether the
+// Authorization header is set.
+func getWithdrawalFeeEstimate(t *testing.T, env testEnv, rawQuery string, bearer bool) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/withdrawals/fee-estimate?"+rawQuery, nil)
+	if bearer {
+		req.Header.Set("Authorization", "Bearer test-token")
+	}
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestGetWithdrawalFeeEstimate_EndToEnd exercises Story 3.1's stateless fee-estimate
+// endpoint against the real wired HTTP stack, but backed by a fake core.FeeEstimator (see
+// fakeFeeEstimator above) — no real chain RPC is needed to prove the HTTP-layer contract
+// (query-param validation, response shape, auth), which is this test's job.
+// fee_estimator_test.go separately proves the real Arbitrum/Base fee-computation logic
+// against fake/canned RPC responses.
+func TestGetWithdrawalFeeEstimate_EndToEnd(t *testing.T) {
+	env := newTestHandler(t)
+
+	t.Run("valid estimate for base/eth", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=eth&amount=1000000000000000000", true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body struct {
+			L2Fee    string `json:"l2Fee"`
+			L1Fee    string `json:"l1Fee"`
+			TotalFee string `json:"totalFee"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if body.L2Fee != "1000" || body.L1Fee != "500" || body.TotalFee != "1500" {
+			t.Fatalf("body = %+v, want l2Fee=1000 l1Fee=500 totalFee=1500", body)
+		}
+	})
+
+	t.Run("valid estimate for base/usdc", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=usdc&amount=42000000", true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("valid estimate for arbitrum/eth", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=arbitrum&asset=eth&amount=1", true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("valid estimate for arbitrum/usdc", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=arbitrum&asset=usdc&amount=1000000", true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var body struct {
+			L2Fee    string `json:"l2Fee"`
+			L1Fee    string `json:"l1Fee"`
+			TotalFee string `json:"totalFee"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		gotTotal, ok := new(big.Int).SetString(body.TotalFee, 10)
+		if !ok {
+			t.Fatalf("totalFee %q is not a base-10 integer", body.TotalFee)
+		}
+		l2, _ := new(big.Int).SetString(body.L2Fee, 10)
+		l1, _ := new(big.Int).SetString(body.L1Fee, 10)
+		if sum := new(big.Int).Add(l2, l1); sum.Cmp(gotTotal) != 0 {
+			t.Fatalf("l2Fee + l1Fee = %s, want equal to totalFee %s", sum, gotTotal)
+		}
+	})
+
+	t.Run("invalid chain enum value returns 400", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=optimism&asset=eth&amount=1", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+			t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+		}
+	})
+
+	t.Run("invalid asset enum value returns 400", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=dai&amount=1", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("zero amount returns 400", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=eth&amount=0", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("amount exceeding a uint256's maximum returns 400", func(t *testing.T) {
+		tooLarge := new(big.Int).Lsh(big.NewInt(1), 256) // 2^256, one past uint256's max
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=eth&amount="+tooLarge.String(), true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("negative amount returns 400", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=eth&amount=-5", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("missing amount returns 400", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=eth", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("non-numeric amount returns 400", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=eth&amount=abc", true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	})
+
+	t.Run("missing bearer token is rejected", func(t *testing.T) {
+		rec := getWithdrawalFeeEstimate(t, env, "chain=base&asset=eth&amount=1", false)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 		}
 	})
 }

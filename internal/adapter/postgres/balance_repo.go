@@ -44,11 +44,19 @@ func (r *BalanceRepository) CustomerBalances(ctx context.Context, customerID str
 		return nil, core.ErrCustomerNotFound
 	}
 
+	// account_type = 'available' (Story 3.2): since that story, every customer has TWO
+	// accounts per (chain, asset) — available and hold — so an unfiltered join here would
+	// silently net a withdrawal's hold reclassification back to zero (its debit on
+	// available and credit on hold are equal and opposite), making a held withdrawal
+	// invisible on this endpoint instead of decreasing the visible balance. This endpoint
+	// surfaces only the available balance; the hold account is not exposed here (Story
+	// 3.2 Verification notes: "introduces no new balances endpoint output for the hold
+	// account itself").
 	rows, err := r.pool.Query(ctx,
 		`SELECT a.chain, a.asset, COALESCE(SUM(p.amount), 0)::text
 		 FROM accounts a
 		 LEFT JOIN postings p ON p.account_id = a.id
-		 WHERE a.customer_id = $1
+		 WHERE a.customer_id = $1 AND a.account_type = 'available'
 		 GROUP BY a.chain, a.asset
 		 ORDER BY a.chain, a.asset`,
 		customerID,

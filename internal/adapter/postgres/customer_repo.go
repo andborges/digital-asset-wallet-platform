@@ -36,8 +36,8 @@ func (r *CustomerRepository) CreateCustomer(ctx context.Context, customer core.C
 	batch := &pgx.Batch{}
 	for _, acc := range accounts {
 		batch.Queue(
-			`INSERT INTO accounts (id, customer_id, chain, asset, created_at) VALUES ($1, $2, $3, $4, $5)`,
-			acc.ID, acc.CustomerID, string(acc.Chain), string(acc.Asset), acc.CreatedAt,
+			`INSERT INTO accounts (id, customer_id, chain, asset, account_type, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+			acc.ID, acc.CustomerID, string(acc.Chain), string(acc.Asset), string(acc.Type), acc.CreatedAt,
 		)
 	}
 	batch.Queue(

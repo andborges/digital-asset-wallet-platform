@@ -212,16 +212,16 @@ func (e TransferChain) Valid() bool {
 
 // Defines values for TransferRequestAsset.
 const (
-	Eth  TransferRequestAsset = "eth"
-	Usdc TransferRequestAsset = "usdc"
+	TransferRequestAssetEth  TransferRequestAsset = "eth"
+	TransferRequestAssetUsdc TransferRequestAsset = "usdc"
 )
 
 // Valid indicates whether the value is a known member of the TransferRequestAsset enum.
 func (e TransferRequestAsset) Valid() bool {
 	switch e {
-	case Eth:
+	case TransferRequestAssetEth:
 		return true
-	case Usdc:
+	case TransferRequestAssetUsdc:
 		return true
 	default:
 		return false
@@ -262,6 +262,144 @@ func (e UnsupportedTokenObservationChain) Valid() bool {
 	default:
 		return false
 	}
+}
+
+// Defines values for WithdrawalAsset.
+const (
+	WithdrawalAssetEth  WithdrawalAsset = "eth"
+	WithdrawalAssetUsdc WithdrawalAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the WithdrawalAsset enum.
+func (e WithdrawalAsset) Valid() bool {
+	switch e {
+	case WithdrawalAssetEth:
+		return true
+	case WithdrawalAssetUsdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WithdrawalChain.
+const (
+	WithdrawalChainArbitrum WithdrawalChain = "arbitrum"
+	WithdrawalChainBase     WithdrawalChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the WithdrawalChain enum.
+func (e WithdrawalChain) Valid() bool {
+	switch e {
+	case WithdrawalChainArbitrum:
+		return true
+	case WithdrawalChainBase:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WithdrawalStatus.
+const (
+	Approved         WithdrawalStatus = "approved"
+	AwaitingApproval WithdrawalStatus = "awaiting-approval"
+	Created          WithdrawalStatus = "created"
+)
+
+// Valid indicates whether the value is a known member of the WithdrawalStatus enum.
+func (e WithdrawalStatus) Valid() bool {
+	switch e {
+	case Approved:
+		return true
+	case AwaitingApproval:
+		return true
+	case Created:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WithdrawalRequestAsset.
+const (
+	WithdrawalRequestAssetEth  WithdrawalRequestAsset = "eth"
+	WithdrawalRequestAssetUsdc WithdrawalRequestAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the WithdrawalRequestAsset enum.
+func (e WithdrawalRequestAsset) Valid() bool {
+	switch e {
+	case WithdrawalRequestAssetEth:
+		return true
+	case WithdrawalRequestAssetUsdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WithdrawalRequestChain.
+const (
+	WithdrawalRequestChainArbitrum WithdrawalRequestChain = "arbitrum"
+	WithdrawalRequestChainBase     WithdrawalRequestChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the WithdrawalRequestChain enum.
+func (e WithdrawalRequestChain) Valid() bool {
+	switch e {
+	case WithdrawalRequestChainArbitrum:
+		return true
+	case WithdrawalRequestChainBase:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for GetWithdrawalFeeEstimateParamsChain.
+const (
+	Arbitrum GetWithdrawalFeeEstimateParamsChain = "arbitrum"
+	Base     GetWithdrawalFeeEstimateParamsChain = "base"
+)
+
+// Valid indicates whether the value is a known member of the GetWithdrawalFeeEstimateParamsChain enum.
+func (e GetWithdrawalFeeEstimateParamsChain) Valid() bool {
+	switch e {
+	case Arbitrum:
+		return true
+	case Base:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for GetWithdrawalFeeEstimateParamsAsset.
+const (
+	GetWithdrawalFeeEstimateParamsAssetEth  GetWithdrawalFeeEstimateParamsAsset = "eth"
+	GetWithdrawalFeeEstimateParamsAssetUsdc GetWithdrawalFeeEstimateParamsAsset = "usdc"
+)
+
+// Valid indicates whether the value is a known member of the GetWithdrawalFeeEstimateParamsAsset enum.
+func (e GetWithdrawalFeeEstimateParamsAsset) Valid() bool {
+	switch e {
+	case GetWithdrawalFeeEstimateParamsAssetEth:
+		return true
+	case GetWithdrawalFeeEstimateParamsAssetUsdc:
+		return true
+	default:
+		return false
+	}
+}
+
+// ApproveWithdrawalRequest defines model for ApproveWithdrawalRequest.
+type ApproveWithdrawalRequest struct {
+	// Actor The operator approving this withdrawal (NFR11) — required and non-empty; this system has no separate operator-identity/auth tier to derive this from.
+	Actor string `json:"actor"`
+
+	// Reason The reason for approving this withdrawal (NFR11) — required and non-empty.
+	Reason string `json:"reason"`
 }
 
 // Balance defines model for Balance.
@@ -327,6 +465,18 @@ type DepositTier string
 // DepositsResponse defines model for DepositsResponse.
 type DepositsResponse struct {
 	Deposits []Deposit `json:"deposits"`
+}
+
+// FeeEstimate defines model for FeeEstimate.
+type FeeEstimate struct {
+	// L1Fee The amortized L1 data-posting fee component, in integer base units (wei), encoded as a string — never a JSON number.
+	L1Fee string `json:"l1Fee"`
+
+	// L2Fee The L2 execution fee component, in integer base units (wei), encoded as a string — never a JSON number — matching Balance's convention.
+	L2Fee string `json:"l2Fee"`
+
+	// TotalFee l2Fee + l1Fee, in integer base units (wei), encoded as a string — never a JSON number, and never a naive single-number estimate collapsing the two components.
+	TotalFee string `json:"totalFee"`
 }
 
 // ProblemDetails defines model for ProblemDetails.
@@ -427,6 +577,56 @@ type UnsupportedTokenObservationsResponse struct {
 	Observations []UnsupportedTokenObservation `json:"observations"`
 }
 
+// Withdrawal defines model for Withdrawal.
+type Withdrawal struct {
+	Amount string `json:"amount"`
+
+	// ApprovalReason The reason given for approving this withdrawal (Story 3.3, NFR11) — absent for an auto-approved withdrawal or one still awaiting approval.
+	ApprovalReason *string `json:"approvalReason,omitempty"`
+
+	// ApprovedAt When this withdrawal was approved (Story 3.3, NFR11) — absent for a withdrawal still awaiting approval.
+	ApprovedAt *time.Time `json:"approvedAt,omitempty"`
+
+	// ApprovedBy The operator (or, for an auto-approved withdrawal, absent) who approved this withdrawal (Story 3.3, NFR11) — caller-supplied at approval time, since this system has no separate operator-identity/auth tier.
+	ApprovedBy         *string            `json:"approvedBy,omitempty"`
+	Asset              WithdrawalAsset    `json:"asset"`
+	Chain              WithdrawalChain    `json:"chain"`
+	CreatedAt          time.Time          `json:"createdAt"`
+	CustomerId         openapi_types.UUID `json:"customerId"`
+	DestinationAddress string             `json:"destinationAddress"`
+	Id                 openapi_types.UUID `json:"id"`
+
+	// Status "created" is a withdrawal's initial status, immediately superseded in the same request by Story 3.3's policy-check-and-route step — no withdrawal is ever observable at rest in this status via this API. "awaiting-approval" is reached when the requested amount exceeds its (chain, asset)'s configured approval threshold (FR17); "approved" is reached either automatically (amount at or below threshold) or via POST /withdrawals/{id}/approve. Later stories (3.4-3.5) add further status values as they add the transitions that produce them.
+	Status WithdrawalStatus `json:"status"`
+}
+
+// WithdrawalAsset defines model for Withdrawal.Asset.
+type WithdrawalAsset string
+
+// WithdrawalChain defines model for Withdrawal.Chain.
+type WithdrawalChain string
+
+// WithdrawalStatus "created" is a withdrawal's initial status, immediately superseded in the same request by Story 3.3's policy-check-and-route step — no withdrawal is ever observable at rest in this status via this API. "awaiting-approval" is reached when the requested amount exceeds its (chain, asset)'s configured approval threshold (FR17); "approved" is reached either automatically (amount at or below threshold) or via POST /withdrawals/{id}/approve. Later stories (3.4-3.5) add further status values as they add the transitions that produce them.
+type WithdrawalStatus string
+
+// WithdrawalRequest defines model for WithdrawalRequest.
+type WithdrawalRequest struct {
+	// Amount Integer base units (wei for ETH, 6-decimal units for USDC), encoded as a string — never a JSON number — matching Balance's convention. Must be a positive integer.
+	Amount     string                 `json:"amount"`
+	Asset      WithdrawalRequestAsset `json:"asset"`
+	Chain      WithdrawalRequestChain `json:"chain"`
+	CustomerId openapi_types.UUID     `json:"customerId"`
+
+	// DestinationAddress The on-chain address the withdrawal will eventually be sent to. Validated for structural well-formedness only (Story 3.2) — never checked against a denylist or any other pre-signing policy, which is Story 3.3's job.
+	DestinationAddress string `json:"destinationAddress"`
+}
+
+// WithdrawalRequestAsset defines model for WithdrawalRequest.Asset.
+type WithdrawalRequestAsset string
+
+// WithdrawalRequestChain defines model for WithdrawalRequest.Chain.
+type WithdrawalRequestChain string
+
 // IdempotencyKey defines model for IdempotencyKey.
 type IdempotencyKey = string
 
@@ -452,8 +652,39 @@ type CreateTransferParams struct {
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
 }
 
+// CreateWithdrawalParams defines parameters for CreateWithdrawal.
+type CreateWithdrawalParams struct {
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
+}
+
+// GetWithdrawalFeeEstimateParams defines parameters for GetWithdrawalFeeEstimate.
+type GetWithdrawalFeeEstimateParams struct {
+	Chain GetWithdrawalFeeEstimateParamsChain `form:"chain" json:"chain"`
+	Asset GetWithdrawalFeeEstimateParamsAsset `form:"asset" json:"asset"`
+
+	// Amount Integer base units (wei for ETH, 6-decimal units for USDC), encoded as a string — matching Balance's convention. Must be a positive integer no larger than a uint256. Validated but not itself a factor in the returned fee: gas cost for a plain transfer or token transfer call does not vary with the transferred amount, so the same fee is returned for any valid amount of a given chain/asset pair.
+	Amount string `form:"amount" json:"amount"`
+}
+
+// GetWithdrawalFeeEstimateParamsChain defines parameters for GetWithdrawalFeeEstimate.
+type GetWithdrawalFeeEstimateParamsChain string
+
+// GetWithdrawalFeeEstimateParamsAsset defines parameters for GetWithdrawalFeeEstimate.
+type GetWithdrawalFeeEstimateParamsAsset string
+
+// ApproveWithdrawalParams defines parameters for ApproveWithdrawal.
+type ApproveWithdrawalParams struct {
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
+}
+
 // CreateTransferJSONRequestBody defines body for CreateTransfer for application/json ContentType.
 type CreateTransferJSONRequestBody = TransferRequest
+
+// CreateWithdrawalJSONRequestBody defines body for CreateWithdrawal for application/json ContentType.
+type CreateWithdrawalJSONRequestBody = WithdrawalRequest
+
+// ApproveWithdrawalJSONRequestBody defines body for ApproveWithdrawal for application/json ContentType.
+type ApproveWithdrawalJSONRequestBody = ApproveWithdrawalRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -478,6 +709,15 @@ type ServerInterface interface {
 	// List every recorded unsupported-token observation, for manual operator triage
 	// (GET /unsupported-token-observations)
 	GetUnsupportedTokenObservations(w http.ResponseWriter, r *http.Request)
+	// Request a withdrawal, placing an immediate ledger-only hold on the requested amount
+	// (POST /withdrawals)
+	CreateWithdrawal(w http.ResponseWriter, r *http.Request, params CreateWithdrawalParams)
+	// Query a withdrawal's estimated fee before submitting one
+	// (GET /withdrawals/fee-estimate)
+	GetWithdrawalFeeEstimate(w http.ResponseWriter, r *http.Request, params GetWithdrawalFeeEstimateParams)
+	// Approve an awaiting-approval withdrawal (Story 3.3, FR17, NFR11)
+	// (POST /withdrawals/{id}/approve)
+	ApproveWithdrawal(w http.ResponseWriter, r *http.Request, id openapi_types.UUID, params ApproveWithdrawalParams)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -768,6 +1008,182 @@ func (siw *ServerInterfaceWrapper) GetUnsupportedTokenObservations(w http.Respon
 	handler.ServeHTTP(w, r)
 }
 
+// CreateWithdrawal operation middleware
+func (siw *ServerInterfaceWrapper) CreateWithdrawal(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateWithdrawalParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey IdempotencyKey
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateWithdrawal(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetWithdrawalFeeEstimate operation middleware
+func (siw *ServerInterfaceWrapper) GetWithdrawalFeeEstimate(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetWithdrawalFeeEstimateParams
+
+	// ------------- Required query parameter "chain" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "chain", r.URL.Query(), &params.Chain, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "chain"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "chain", Err: err})
+		}
+		return
+	}
+
+	// ------------- Required query parameter "asset" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "asset", r.URL.Query(), &params.Asset, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "asset"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "asset", Err: err})
+		}
+		return
+	}
+
+	// ------------- Required query parameter "amount" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "amount", r.URL.Query(), &params.Amount, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "amount"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "amount", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetWithdrawalFeeEstimate(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ApproveWithdrawal operation middleware
+func (siw *ServerInterfaceWrapper) ApproveWithdrawal(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id openapi_types.UUID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid"})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ApproveWithdrawalParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey IdempotencyKey
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ApproveWithdrawal(w, r, id, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 type UnescapedCookieParamError struct {
 	ParamName string
 	Err       error
@@ -895,6 +1311,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/customers/{id}/transactions", wrapper.ListCustomerTransactions)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/transfers", wrapper.CreateTransfer)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/unsupported-token-observations", wrapper.GetUnsupportedTokenObservations)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/withdrawals", wrapper.CreateWithdrawal)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/withdrawals/fee-estimate", wrapper.GetWithdrawalFeeEstimate)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/withdrawals/{id}/approve", wrapper.ApproveWithdrawal)
 
 	return m
 }
@@ -904,62 +1323,94 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
-	"TfohvuK/vb75/wAAAP//",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

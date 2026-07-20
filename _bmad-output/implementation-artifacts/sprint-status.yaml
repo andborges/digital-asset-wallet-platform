@@ -64,9 +64,9 @@ development_status:
   2-5-recover-from-watcher-downtime-without-loss-or-double-processing: done
   epic-2-retrospective: optional
 
-  epic-3: backlog
-  3-1-query-fee-estimate-before-submitting-a-withdrawal: backlog
-  3-2-request-a-withdrawal-with-idempotent-hold-placement: backlog
+  epic-3: in-progress
+  3-1-query-fee-estimate-before-submitting-a-withdrawal: done
+  3-2-request-a-withdrawal-with-idempotent-hold-placement: done
   3-3-enforce-pre-signing-policy-and-threshold-based-approval-routing: backlog
   3-4-sign-and-broadcast-withdrawals-via-the-single-writer-broadcaster: backlog
   3-5-resolve-stuck-and-failed-withdrawals: backlog

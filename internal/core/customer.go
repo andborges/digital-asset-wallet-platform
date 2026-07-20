@@ -70,13 +70,33 @@ var SupportedChainAssetPairs = []struct {
 	{ChainArbitrum, AssetUSDC},
 }
 
-// Account is a per-customer, per-(chain, asset) ledger account. It carries no balance
-// field: balances are always derived from postings (AD-3) via BalanceRepository.
+// AccountType distinguishes a customer's "available" balance from its "hold" balance for
+// the same (chain, asset) pair (Story 3.2). A hold account is a plain sibling row in this
+// same accounts table, not a separate schema: accounts already carries every column a hold
+// account needs, and postings/balance derivation is entirely generic over account_id (see
+// Story 3.2's Design Notes).
+type AccountType string
+
+const (
+	// AccountTypeAvailable is a customer's ordinary, spendable balance for a (chain, asset)
+	// pair — the only account type that existed before Story 3.2, and the only one
+	// TransferRepository, BalanceRepository, and CreditFinalizedDeposits ever move money
+	// into or out of.
+	AccountTypeAvailable AccountType = "available"
+	// AccountTypeHold is where a requested withdrawal's amount is reclassified to the
+	// instant it is accepted (Story 3.2) — reserved, but not yet sent on-chain.
+	AccountTypeHold AccountType = "hold"
+)
+
+// Account is a per-customer, per-(chain, asset), per-account-type ledger account. It
+// carries no balance field: balances are always derived from postings (AD-3) via
+// BalanceRepository.
 type Account struct {
 	ID         string
 	CustomerID string
 	Chain      Chain
 	Asset      Asset
+	Type       AccountType
 	CreatedAt  time.Time
 }
 

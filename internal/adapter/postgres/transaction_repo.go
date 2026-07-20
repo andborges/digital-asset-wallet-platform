@@ -135,12 +135,11 @@ func (r *TransactionRepository) decodeCursor(customerID, cursor string) (created
 // posting id is a persistence detail (deliberately not surfaced on core.Transaction) and
 // exists here only to build the keyset cursor: it is the finest component of the sort key
 // because (created_at, journal_entry_id) alone is NOT unique per result row. The query
-// emits one row per (journal_entry, posting), and a single journal entry can produce more
-// than one posting on this customer's own accounts. No such cause type exists today
-// (internal_transfer writes exactly one posting per customer), but the query is generic by
-// construction (AC4), so a future multi-posting cause type would yield two rows sharing an
-// identical (created_at, je.id); the row-wise cursor comparison would then drop or repeat
-// one of them across a page boundary. The posting id, unique per row, closes that gap.
+// emits one row per (journal_entry, posting); a single journal entry can still produce more
+// than one posting on this customer's own accounts if a future cause type posts to two of
+// this customer's accounts of the SAME account_type in one entry (none does today), so the
+// posting id remains the correct finest sort-key component even after the account_type
+// filter below (Story 3.2 re-review) closes the one such case that exists today.
 type pagedTransaction struct {
 	txn       core.Transaction
 	postingID string
@@ -152,6 +151,14 @@ type pagedTransaction struct {
 // anywhere, so future cause types appear automatically (FR3, AC4). Pagination is keyset
 // on (created_at, journal_entry_id, posting_id) DESC, encoded in a signed opaque cursor
 // (see encodeCursor/decodeCursor).
+//
+// Restricted to account_type = 'available' (Story 3.2 re-review, adversarial review):
+// a withdrawal hold's journal entry posts to this customer's OWN available and hold
+// accounts in one entry — without this filter, that single entry surfaced as two rows
+// sharing one journal_entry_id with opposite-signed amounts (the hold account is never
+// exposed by any endpoint per this story's own boundary). The available-side posting is
+// what the customer's transaction history should show — mirroring how CreateTransfer's
+// debit side is what the sending customer sees.
 func (r *TransactionRepository) ListCustomerTransactions(ctx context.Context, customerID string, pageSize int, cursor string) (core.TransactionPage, error) {
 	var exists bool
 	if err := r.pool.QueryRow(ctx,
@@ -188,7 +195,7 @@ func (r *TransactionRepository) ListCustomerTransactions(ctx context.Context, cu
 		 FROM journal_entries je
 		 JOIN postings p ON p.journal_entry_id = je.id
 		 JOIN accounts a ON a.id = p.account_id
-		 WHERE a.customer_id = $1
+		 WHERE a.customer_id = $1 AND a.account_type = 'available'
 		   AND ($2::boolean IS FALSE OR (je.created_at, je.id, p.id) < ($3, $4, $5))
 		 ORDER BY je.created_at DESC, je.id DESC, p.id DESC
 		 LIMIT $6`,

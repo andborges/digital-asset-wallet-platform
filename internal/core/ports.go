@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"math/big"
 )
 
 // CustomerRepository persists a customer, its accounts, and its deposit address.
@@ -216,6 +217,75 @@ type UnsupportedTokenRepository interface {
 	// first — a flat, platform-wide list for manual operator triage (AC3), never filtered
 	// or scoped to a customer.
 	ListObservations(ctx context.Context) ([]UnsupportedTokenObservation, error)
+}
+
+// FeeEstimator estimates a withdrawal's on-chain fee for chain, split into its L2
+// execution and L1 data-posting components (Story 3.1) — never collapsed into one
+// undifferentiated number. Implemented in internal/adapter/evm (AD-1): Arbitrum via
+// NodeInterface.gasEstimateComponents() (an ArbOS-native precompile, called via raw RPC,
+// never a typed contract binding — it has no deployed bytecode), Base via the
+// GasPriceOracle predeploy (eth_estimateGas/eth_gasPrice for the L2 component,
+// getL1FeeUpperBound for the L1 component). Both implementations estimate against a
+// fixed representative transaction — empty data for ETH, an ABI-encoded
+// transfer(placeholder, amount) against the chain's registered USDC contract for USDC —
+// since this endpoint's inputs carry no real withdrawal destination and no withdrawal
+// resource exists until Story 3.2 (this is a pure, unpersisted, read-only computation).
+type FeeEstimator interface {
+	EstimateFee(ctx context.Context, chain Chain, asset Asset, amount *big.Int) (FeeEstimate, error)
+}
+
+// WithdrawalRepository persists a requested withdrawal's immediate hold placement (Story
+// 3.2) as one balanced journal entry (debit the customer's available account, credit its
+// hold account, same (chain, asset) pair) plus the withdrawals row and its paired outbox
+// event — all atomically — and (Story 3.3) the subsequent policy-check-and-route
+// transition into either awaiting-approval or approved, in that SAME transaction. Like
+// TransferRepository, implementations must run their writes against whatever transaction
+// is already open on ctx (established by IdempotencyMiddleware for this mutating POST)
+// rather than opening their own.
+type WithdrawalRepository interface {
+	// CreateWithdrawal locks the customer's available and hold accounts for
+	// (req.Chain, req.Asset) in a single deterministic-order statement (mirroring
+	// TransferRepository.CreateTransfer's own lock-ordering discipline), verifies the
+	// available account's derived balance covers req.Amount, and writes the journal
+	// entry, its two postings, and the withdrawals row atomically. feeEstimate and
+	// targetStatus are computed by the caller (CreateWithdrawal, core) BEFORE this method
+	// is ever invoked — this method never calls FeeEstimator or WithdrawalThresholdLister
+	// itself (AD-1's adapters-don't-call-adapters rule) — and are used only to (a) verify
+	// the SAME already-locked available-account balance read, post-hold, covers
+	// feeEstimate (ErrInsufficientBalanceForFee if not, with no partial write: the whole
+	// call returns an error and nothing commits) and (b) write targetStatus
+	// (WithdrawalStatusAwaitingApproval or WithdrawalStatusApproved) as the withdrawals
+	// row's status, together with the matching paired outbox event ("approval.required"
+	// or "withdrawal.approved"). Returns ErrCustomerNotFound if the customer has no
+	// available/hold accounts for (req.Chain, req.Asset), ErrInsufficientBalance if the
+	// available account's derived balance is less than req.Amount, ErrInsufficientBalanceForFee
+	// per the above, or ErrDuplicateWithdrawalCause on a duplicate cause_id (a narrow
+	// concurrent-request race — see internal/adapter/postgres/withdrawal_repo.go).
+	CreateWithdrawal(ctx context.Context, req WithdrawalRequest, feeEstimate *big.Int, targetStatus string) (Withdrawal, error)
+	// ApproveWithdrawal locks the withdrawal row FOR UPDATE, verifies its status is
+	// WithdrawalStatusAwaitingApproval, and transitions it to WithdrawalStatusApproved,
+	// recording actor/reason/timestamp on the row (approved_by, approval_reason,
+	// approved_at, NFR11) and writing a paired "withdrawal.approved" outbox event —
+	// atomically, in the transaction already open on ctx. Returns ErrWithdrawalNotFound if
+	// no withdrawal with id exists, or ErrWithdrawalNotAwaitingApproval if it exists but is
+	// not currently awaiting approval (already approved — including the losing side of a
+	// concurrent double-approve race, made deterministic by the row lock — or still
+	// created).
+	ApproveWithdrawal(ctx context.Context, id, actor, reason string) (Withdrawal, error)
+}
+
+// WithdrawalThresholdLister reads a (chain, asset) pair's configured withdrawal approval
+// threshold (Story 3.3, FR17) from the withdrawal_approval_thresholds data table — never a
+// Go constant, mirroring migration 0006's crediting_policy precedent (FR9-style "policy is
+// data, not code"). Implemented in internal/adapter/postgres, the same small-repo shape as
+// TokenRegistryLister.
+type WithdrawalThresholdLister interface {
+	// GetApprovalThreshold returns chain/asset's configured threshold amount. Returns a
+	// "no threshold configured" error — never a guessed default — if no row exists for the
+	// pair (a registry gap, the I/O matrix's own "should never happen in a correctly
+	// configured deployment" case): a withdrawal must never be silently auto-approved or
+	// silently blocked because a threshold row is missing.
+	GetApprovalThreshold(ctx context.Context, chain Chain, asset Asset) (*big.Int, error)
 }
 
 // Tx, TxBeginner, and IdempotencyStore below are cross-cutting architectural ports

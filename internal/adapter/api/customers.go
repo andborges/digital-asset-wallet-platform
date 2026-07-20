@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -11,8 +12,9 @@ import (
 )
 
 // customerServer implements the generated ServerInterface. It holds no state of its
-// own beyond the use cases it delegates to — all persistence and transaction handling
-// happens through the core use cases and the ports they were constructed with.
+// own beyond the use cases it delegates to (plus a logger for server-side-only error
+// detail, Story 3.1) — all persistence and transaction handling happens through the core
+// use cases and the ports they were constructed with.
 type customerServer struct {
 	createCustomer                   *core.CreateCustomer
 	getCustomer                      *core.GetCustomer
@@ -21,11 +23,17 @@ type customerServer struct {
 	listTransactions                 *core.ListCustomerTransactions
 	getDeposits                      *core.GetCustomerDeposits
 	listUnsupportedTokenObservations *core.ListUnsupportedTokenObservations
+	estimateFee                      *core.EstimateFee
+	createWithdrawal                 *core.CreateWithdrawal
+	approveWithdrawal                *core.ApproveWithdrawal
+	logger                           *slog.Logger
 }
 
 // NewServerInterface constructs the generated ServerInterface implementation. Later
-// stories add their own use cases here as this service grows.
-func NewServerInterface(createCustomer *core.CreateCustomer, getCustomer *core.GetCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer, listTransactions *core.ListCustomerTransactions, getDeposits *core.GetCustomerDeposits, listUnsupportedTokenObservations *core.ListUnsupportedTokenObservations) ServerInterface {
+// stories add their own use cases here as this service grows. logger stays the trailing
+// parameter (Story 3.1) so every later story's own new use case parameter is inserted
+// before it, never after.
+func NewServerInterface(createCustomer *core.CreateCustomer, getCustomer *core.GetCustomer, getBalances *core.GetCustomerBalances, createTransfer *core.CreateTransfer, listTransactions *core.ListCustomerTransactions, getDeposits *core.GetCustomerDeposits, listUnsupportedTokenObservations *core.ListUnsupportedTokenObservations, estimateFee *core.EstimateFee, createWithdrawal *core.CreateWithdrawal, approveWithdrawal *core.ApproveWithdrawal, logger *slog.Logger) ServerInterface {
 	return &customerServer{
 		createCustomer:                   createCustomer,
 		getCustomer:                      getCustomer,
@@ -34,6 +42,10 @@ func NewServerInterface(createCustomer *core.CreateCustomer, getCustomer *core.G
 		listTransactions:                 listTransactions,
 		getDeposits:                      getDeposits,
 		listUnsupportedTokenObservations: listUnsupportedTokenObservations,
+		estimateFee:                      estimateFee,
+		createWithdrawal:                 createWithdrawal,
+		approveWithdrawal:                approveWithdrawal,
+		logger:                           logger,
 	}
 }
 

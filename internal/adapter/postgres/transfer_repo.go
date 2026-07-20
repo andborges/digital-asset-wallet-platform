@@ -40,9 +40,15 @@ func (r *TransferRepository) CreateTransfer(ctx context.Context, req core.Transf
 	// this lock for the rest of the transaction is also what makes the balance check below
 	// race-free: a concurrent transfer against the same source account cannot even read
 	// the balance until this transaction commits or rolls back.
+	// account_type = 'available' (Story 3.2): since that story, every customer has TWO
+	// accounts per (chain, asset) — available and hold — so an unfiltered lookup here
+	// would return up to 4 rows instead of 2, and accountByCustomer's map assignment below
+	// would nondeterministically pick whichever account (available or hold) happened to
+	// sort last per customer. An internal transfer only ever moves a customer's available
+	// balance; it never touches the hold account, which exists solely for withdrawal holds.
 	rows, err := tx.Query(ctx,
 		`SELECT id, customer_id FROM accounts
-		 WHERE chain = $1 AND asset = $2 AND customer_id = ANY($3::uuid[])
+		 WHERE chain = $1 AND asset = $2 AND customer_id = ANY($3::uuid[]) AND account_type = 'available'
 		 ORDER BY id
 		 FOR UPDATE`,
 		string(req.Chain), string(req.Asset), []string{req.SourceCustomerID, req.DestinationCustomerID},

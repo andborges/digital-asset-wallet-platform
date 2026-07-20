@@ -51,7 +51,7 @@ func newTestCreateCustomer(repo *fakeCustomerRepository, deriver *fakeDepositAdd
 	return NewCreateCustomer(repo, deriver)
 }
 
-func TestCreateCustomer_ProvisionsFourFixedAccounts(t *testing.T) {
+func TestCreateCustomer_ProvisionsAvailableAndHoldAccountsForEveryPair(t *testing.T) {
 	repo := &fakeCustomerRepository{}
 	uc := newTestCreateCustomer(repo, nil)
 
@@ -70,8 +70,11 @@ func TestCreateCustomer_ProvisionsFourFixedAccounts(t *testing.T) {
 		t.Fatalf("repo received customer ID %q, want %q", repo.customer.ID, customer.ID)
 	}
 
-	if len(repo.accounts) != len(SupportedChainAssetPairs) {
-		t.Fatalf("got %d accounts, want %d", len(repo.accounts), len(SupportedChainAssetPairs))
+	// Story 3.2: both an available and a hold account per supported (chain, asset) pair —
+	// 2 accounts x 4 pairs = 8 total.
+	wantCount := len(SupportedChainAssetPairs) * 2
+	if len(repo.accounts) != wantCount {
+		t.Fatalf("got %d accounts, want %d", len(repo.accounts), wantCount)
 	}
 
 	seen := map[string]bool{}
@@ -82,17 +85,22 @@ func TestCreateCustomer_ProvisionsFourFixedAccounts(t *testing.T) {
 		if acc.ID == "" {
 			t.Fatalf("account %+v has empty ID", acc)
 		}
-		key := string(acc.Chain) + "/" + string(acc.Asset)
+		if acc.Type != AccountTypeAvailable && acc.Type != AccountTypeHold {
+			t.Fatalf("account %+v has unexpected Type %q", acc, acc.Type)
+		}
+		key := string(acc.Chain) + "/" + string(acc.Asset) + "/" + string(acc.Type)
 		if seen[key] {
-			t.Fatalf("duplicate (chain, asset) pair provisioned: %s", key)
+			t.Fatalf("duplicate (chain, asset, type) provisioned: %s", key)
 		}
 		seen[key] = true
 	}
 
 	for _, pair := range SupportedChainAssetPairs {
-		key := string(pair.Chain) + "/" + string(pair.Asset)
-		if !seen[key] {
-			t.Fatalf("missing expected account for (chain, asset) = %s", key)
+		for _, accountType := range []AccountType{AccountTypeAvailable, AccountTypeHold} {
+			key := string(pair.Chain) + "/" + string(pair.Asset) + "/" + string(accountType)
+			if !seen[key] {
+				t.Fatalf("missing expected account for (chain, asset, type) = %s", key)
+			}
 		}
 	}
 }

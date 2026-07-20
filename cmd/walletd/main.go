@@ -159,8 +159,19 @@ func runAPI(logger *slog.Logger) error {
 	getDeposits := core.NewGetCustomerDeposits(depositReader)
 	unsupportedTokenRepo := postgres.NewUnsupportedTokenRepository(pool)
 	listUnsupportedTokenObservations := core.NewListUnsupportedTokenObservations(unsupportedTokenRepo)
+	tokenRegistry := postgres.NewTokenRegistry(pool)
+	feeEstimator, err := evm.NewFeeEstimator(ctx, chains, tokenRegistry)
+	if err != nil {
+		return fmt.Errorf("connect fee estimator RPC clients: %w", err)
+	}
+	defer feeEstimator.Close()
+	estimateFee := core.NewEstimateFee(feeEstimator)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+	withdrawalThresholdLister := postgres.NewWithdrawalThresholdLister(pool)
+	createWithdrawal := core.NewCreateWithdrawal(withdrawalRepo, feeEstimator, withdrawalThresholdLister)
+	approveWithdrawal := core.NewApproveWithdrawal(withdrawalRepo)
 
-	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions, getDeposits, listUnsupportedTokenObservations)
+	serverImpl := adapterapi.NewServerInterface(createCustomer, getCustomer, getBalances, createTransfer, listTransactions, getDeposits, listUnsupportedTokenObservations, estimateFee, createWithdrawal, approveWithdrawal, logger)
 	mux := http.NewServeMux()
 	handler := adapterapi.HandlerWithOptions(serverImpl, adapterapi.StdHTTPServerOptions{
 		BaseRouter: mux,
