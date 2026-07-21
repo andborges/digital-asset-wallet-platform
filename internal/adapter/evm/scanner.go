@@ -277,19 +277,23 @@ func (s *Scanner) scanNativeTransfers(ctx context.Context, known map[common.Addr
 		if err := s.client.CallContext(ctx, &block, "eth_getBlockByNumber", hexutil.EncodeUint64(blockNum), true); err != nil {
 			return nil, fmt.Errorf("query %s for block %d: %w", s.chain.Name, blockNum, err)
 		}
+
 		for _, tx := range block.Transactions {
 			if tx.To == nil {
 				// Contract creation — never a transfer to an already-known address.
 				continue
 			}
+
 			addr, ok := known[*tx.To]
 			if !ok {
 				continue
 			}
+
 			value := (*big.Int)(tx.Value)
 			if value == nil || value.Sign() <= 0 {
 				continue
 			}
+
 			transfers = append(transfers, core.ObservedTransfer{
 				Chain:       core.Chain(s.chain.Name),
 				Asset:       core.AssetETH,
@@ -360,6 +364,7 @@ func (s *Scanner) scanInternalTransfers(ctx context.Context, known map[common.Ad
 			s.logger.Warn("debug_traceBlockByNumber failed — permanently disabling internal-transfer detection for this watcher process (top-level and ERC-20 detection are unaffected); restart the watcher to re-probe",
 				"chain", s.chain.Name, "block", blockNum, "error", err)
 		}
+
 		return nil
 	}
 
@@ -376,16 +381,19 @@ func (s *Scanner) scanInternalTransfers(ctx context.Context, known map[common.Ad
 		}
 
 		dfsIndex := 0
+
 		var walk func(frame callFrame, reverted bool)
 		walk = func(frame callFrame, reverted bool) {
 			for _, child := range frame.Calls {
 				idx := dfsIndex
 				dfsIndex++
+
 				childReverted := reverted || child.Error != ""
 
 				if !childReverted && child.Type == "CALL" && child.To != nil && child.Value != nil {
 					if addr, ok := known[*child.To]; ok {
 						value := (*big.Int)(child.Value)
+
 						if value.Sign() > 0 {
 							transfers = append(transfers, core.ObservedTransfer{
 								Chain:       core.Chain(s.chain.Name),
@@ -416,6 +424,8 @@ func (s *Scanner) scanInternalTransfers(ctx context.Context, known map[common.Ad
 				walk(child, childReverted)
 			}
 		}
+
+		// Recurse into the root frame's children only, skipping the root itself: the top-level
 		walk(trace.Result, trace.Result.Error != "")
 	}
 
@@ -455,6 +465,7 @@ func (s *Scanner) scanERC20Transfers(ctx context.Context, known map[common.Addre
 		ToBlock:   new(big.Int).SetUint64(toBlock),
 		Topics:    [][]common.Hash{{erc20TransferSignature}, nil, toTopics},
 	}
+
 	logs, err := s.client.FilterLogs(ctx, query)
 	if err != nil {
 		return nil, nil, fmt.Errorf("query %s for ERC-20 transfer logs: %w", s.chain.Name, err)
@@ -462,6 +473,7 @@ func (s *Scanner) scanERC20Transfers(ctx context.Context, known map[common.Addre
 
 	var transfers []core.ObservedTransfer
 	var unsupported []core.UnsupportedTokenObservation
+
 	for _, l := range logs {
 		if l.Removed || len(l.Topics) != 3 || len(l.Data) != 32 {
 			// A standard Transfer(address,address,uint256) log always has exactly 3
@@ -477,11 +489,13 @@ func (s *Scanner) scanERC20Transfers(ctx context.Context, known map[common.Addre
 			// poll) identically forever on the same block range.
 			continue
 		}
+
 		toAddr := common.BytesToAddress(l.Topics[2].Bytes())
 		addr, ok := known[toAddr]
 		if !ok {
 			continue
 		}
+
 		// SetBytes always produces a non-negative value (it decodes Data as an unsigned
 		// magnitude) — Sign() <= 0 here can only ever catch zero, never a negative
 		// decode. A standards-valid zero-value Transfer event carries no actual deposit,
