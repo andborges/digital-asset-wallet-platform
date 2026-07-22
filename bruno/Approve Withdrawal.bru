@@ -1,0 +1,47 @@
+meta {
+  name: Approve Withdrawal
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/withdrawals/:id/approve
+  body: json
+  auth: inherit
+}
+
+params:path {
+  id: {{withdrawalId}}
+}
+
+headers {
+  Idempotency-Key: {{idempotencyKey}}
+}
+
+body:json {
+  {
+    "actor": "ops-jane",
+    "reason": "manual review passed"
+  }
+}
+
+script:pre-request {
+  bru.setVar("idempotencyKey", `approve-withdrawal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+}
+
+docs {
+  Set the environment's withdrawalId var to an id returned by Create
+  Withdrawal that came back "awaiting-approval" (an amount above its
+  (chain, asset)'s configured approval threshold, FR17). Approving an
+  already-approved or non-existent withdrawal is rejected loudly (409/404),
+  never a silent no-op.
+
+  "actor" and "reason" are both required and non-empty (NFR11) — this
+  system has no separate operator-identity/auth tier, so the approving
+  operator is caller-supplied here rather than derived from the request's
+  auth context.
+}

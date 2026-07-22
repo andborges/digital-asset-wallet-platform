@@ -1,0 +1,51 @@
+meta {
+  name: Create Withdrawal
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{baseUrl}}/withdrawals
+  body: json
+  auth: inherit
+}
+
+headers {
+  Idempotency-Key: {{idempotencyKey}}
+}
+
+body:json {
+  {
+    "customerId": "{{customerId}}",
+    "chain": "base",
+    "asset": "eth",
+    "amount": "1000000000000000",
+    "destinationAddress": "0x00000000000000000000000000000000000000AA"
+  }
+}
+
+script:pre-request {
+  bru.setVar("idempotencyKey", `create-withdrawal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+
+  // Capture the new withdrawal's id for Approve Withdrawal to use.
+  const body = res.getBody();
+  bru.setVar("withdrawalId", (body && body.id) || "");
+}
+
+docs {
+  Set the environment's customerId var to an id returned by Create Customer.
+  The customer's available account needs a credited balance covering the
+  amount (plus its estimated fee, Story 3.3) before this can succeed — see
+  Get Withdrawal Fee Estimate.
+
+  Places an immediate ledger-only hold (debit available / credit hold) for
+  the requested amount — no on-chain transaction is created by this
+  endpoint. The response's status reflects Story 3.3's pre-signing policy
+  routing: "awaiting-approval" if the amount exceeds its (chain, asset)'s
+  configured approval threshold, "approved" otherwise (auto-approved). Use
+  Approve Withdrawal for the former.
+}

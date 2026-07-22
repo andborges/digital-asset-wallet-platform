@@ -1,0 +1,33 @@
+meta {
+  name: Get Withdrawal Fee Estimate
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/withdrawals/fee-estimate?chain=base&asset=eth&amount=1000000000000000
+  body: none
+  auth: inherit
+}
+
+params:query {
+  chain: base
+  asset: eth
+  amount: 1000000000000000
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+}
+
+docs {
+  Pure, unpersisted, read-only computation — nothing is written and no
+  withdrawal resource is created. Combines the L2 execution fee and the
+  amortized L1 data-posting fee for the given chain (Arbitrum via
+  NodeInterface.gasEstimateComponents(), Base via the GasPriceOracle
+  predeploy), always returned as separate components alongside their sum.
+
+  `amount` is base units encoded as a string (wei for eth, 6-decimal units
+  for usdc) and does not itself affect the returned fee — gas cost for a
+  plain transfer/token-transfer call doesn't vary with the amount moved.
+}

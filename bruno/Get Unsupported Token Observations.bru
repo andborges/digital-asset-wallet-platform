@@ -1,0 +1,25 @@
+meta {
+  name: Get Unsupported Token Observations
+  type: http
+  seq: 10
+}
+
+get {
+  url: {{baseUrl}}/unsupported-token-observations
+  body: none
+  auth: inherit
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+}
+
+docs {
+  A top-level, platform-wide route — not nested under /customers/{id} —
+  since an unsupported-token observation is operator-facing, not scoped to
+  any one customer (Story 2.3, FR11). Lists every recorded observation,
+  newest first: a Transfer log from a token contract not in the
+  token_registry, recorded here instead of as a deposit — never credited,
+  never touching the ledger. Still requires the same bearer auth as every
+  other route.
+}

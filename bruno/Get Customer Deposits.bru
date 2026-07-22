@@ -1,0 +1,27 @@
+meta {
+  name: Get Customer Deposits
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/customers/:id/deposits
+  body: none
+  auth: inherit
+}
+
+params:path {
+  id: {{customerId}}
+}
+
+script:post-response {
+  console.log("Response Body: " + JSON.stringify(res.getBody(), null, 2));
+}
+
+docs {
+  Set the environment's customerId var to an id returned by Create Customer.
+  Returns deposits still in the observed or safe tier, both surfaced as status
+  "pending" (Story 2.2 adds the finalized/credited tiers and a non-pending
+  status). Attribution is resolved via the customer's own deposit address
+  (AD-8) — a deposit never carries a customer id of its own.
+}
