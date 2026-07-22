@@ -91,11 +91,12 @@ var ErrWithdrawalNotFound = errors.New("withdrawal not found")
 // winning request's commit and is served by IdempotencyMiddleware's own dedup.
 var ErrDuplicateWithdrawalCause = errors.New("a journal entry already exists for this idempotency key")
 
-// ErrWithdrawalNotSigned is returned by WithdrawalRepository.RecordBroadcastTxHash when the
-// withdrawal being recorded is not currently at WithdrawalStatusSigned — defensive, should
-// be unreachable: SignAndBroadcastWithdrawal only ever calls this immediately after its own
-// ClaimApprovedWithdrawal call transitioned the same row to WithdrawalStatusSigned, in the
-// same broadcaster process, with no other writer of withdrawals.status ever running
+// ErrWithdrawalNotSigned is returned by WithdrawalRepository.RecordSignedTx/MarkBroadcast
+// (Story 3.5, replacing Story 3.4's RecordBroadcastTxHash) when the withdrawal being
+// recorded/transitioned is not currently at WithdrawalStatusSigned — defensive, should be
+// unreachable: SignAndBroadcastWithdrawal only ever calls these against a row its own
+// ClaimApprovedWithdrawal or ListSignedWithdrawals call already found at WithdrawalStatusSigned,
+// in the same broadcaster process, with no other writer of withdrawals.status ever running
 // concurrently against the same row (AD-11: exactly one broadcaster process per chain).
 var ErrWithdrawalNotSigned = errors.New("withdrawal is not signed")
 
@@ -147,4 +148,19 @@ type Withdrawal struct {
 	// only, never per-address) — nil until claimed (still WithdrawalStatusApproved or
 	// earlier), populated from WithdrawalStatusSigned onward.
 	Nonce *int64
+	// SignedTx is this withdrawal's exact signed transaction bytes, as already returned by
+	// TransactionBroadcaster.AssembleSignedTx and persisted by WithdrawalRepository.
+	// RecordSignedTx BEFORE any send is ever attempted (Story 3.5's core restructuring,
+	// Design Notes) — nil/empty for a withdrawal claimed but not yet signed this attempt,
+	// populated (via ListSignedWithdrawals) for one already signed in a prior attempt, crash,
+	// or interrupted send: SignAndBroadcastWithdrawal.Execute branches on exactly this field
+	// to decide "build/sign fresh" vs. "resend these exact bytes, never re-sign." A plain
+	// []byte, not a go-ethereum type (AD-1) — the same opaque shape
+	// TransactionBroadcaster.SendRawTransaction already takes.
+	SignedTx []byte
+	// StuckAlertedAt records when DetectStuckWithdrawals wrote this withdrawal's one-time
+	// "withdrawal.stuck" outbox event (Story 3.5) — nil until that happens, and never cleared
+	// afterward even once the withdrawal later confirms or fails (I/O & Edge-Case Matrix's own
+	// last row: a historical fact, not a live status).
+	StuckAlertedAt *time.Time
 }

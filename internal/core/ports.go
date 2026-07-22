@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"time"
 )
 
 // CustomerRepository persists a customer, its accounts, and its deposit address.
@@ -291,14 +292,37 @@ type WithdrawalRepository interface {
 	// withdrawal exists to claim on chain — an ordinary "nothing to do this poll" outcome,
 	// never an error. The returned Withdrawal's Nonce is always populated when ok is true.
 	ClaimApprovedWithdrawal(ctx context.Context, chain Chain) (w Withdrawal, ok bool, err error)
-	// RecordBroadcastTxHash records txHash on both broadcast_attempts and withdrawals (the
-	// latter a denormalized read-convenience column, Design Notes) and transitions the
-	// withdrawal to WithdrawalStatusBroadcast — called only after
-	// TransactionBroadcaster.SendRawTransaction has already succeeded. Returns
-	// ErrWithdrawalNotFound if no such withdrawal exists, or ErrWithdrawalNotSigned if it
-	// exists but is not currently at WithdrawalStatusSigned (defensive, see that error's
-	// own doc comment).
-	RecordBroadcastTxHash(ctx context.Context, withdrawalID, txHash string) error
+	// RecordSignedTx (Story 3.5) persists txHash and the exact signed transaction bytes
+	// (signedTxHex, hex-encoded) onto this withdrawal's broadcast_attempts row BEFORE any
+	// send is ever attempted (Boundaries & Constraints' own ordering) — withdrawals.status
+	// stays WithdrawalStatusSigned; this method never transitions it. This is what makes
+	// resuming after ANY interruption (crash, transient send error, restart) safe: the next
+	// poll cycle's ListSignedWithdrawals call finds this exact byte sequence already
+	// persisted and re-sends it verbatim, never re-signing (Design Notes: AWS KMS's ECDSA
+	// signing is not guaranteed deterministic). Returns ErrWithdrawalNotFound if no such
+	// withdrawal exists, or ErrWithdrawalNotSigned if it exists but is not currently at
+	// WithdrawalStatusSigned (defensive, see that error's own doc comment). Replaces Story
+	// 3.4's RecordBroadcastTxHash, which combined this persist step with the broadcast
+	// transition itself — split apart because the two must now straddle the network send.
+	RecordSignedTx(ctx context.Context, withdrawalID, txHash, signedTxHex string) error
+	// MarkBroadcast (Story 3.5) transitions the withdrawal from WithdrawalStatusSigned to
+	// WithdrawalStatusBroadcast, copying broadcast_attempts.tx_hash onto the denormalized
+	// withdrawals.tx_hash column (Design Notes) — called only after
+	// TransactionBroadcaster.SendRawTransaction has either succeeded outright, or failed with
+	// an error recognized as "already known"/"nonce too low" (Boundaries & Constraints: both
+	// mean some transaction at this nonce already reached the node or chain, which under
+	// AD-11's single-writer guarantee can only be this withdrawal's own prior attempt).
+	// Returns ErrWithdrawalNotFound if no such withdrawal exists, or ErrWithdrawalNotSigned if
+	// it exists but is not currently at WithdrawalStatusSigned.
+	MarkBroadcast(ctx context.Context, withdrawalID string) error
+	// ListSignedWithdrawals (Story 3.5) returns every withdrawal on chain currently at
+	// WithdrawalStatusSigned, each with its own broadcast_attempts row's nonce/tx_hash/
+	// signed_tx populated onto the returned Withdrawal (Nonce/TxHash/SignedTx) —
+	// SignAndBroadcastWithdrawal.Execute's own resume set, checked FIRST every call, ahead of
+	// claiming any new work: a non-empty SignedTx means "resend these exact bytes, never
+	// re-sign"; an empty one means "claimed but never signed this attempt, run the full
+	// build/sign/persist/send pipeline."
+	ListSignedWithdrawals(ctx context.Context, chain Chain) ([]Withdrawal, error)
 	// ListBroadcastWithdrawals returns every withdrawal on chain currently at
 	// WithdrawalStatusBroadcast with a known tx_hash — PollWithdrawalReceipts' own input set
 	// each poll cycle.
@@ -320,6 +344,37 @@ type WithdrawalRepository interface {
 	// entry (debit hold, credit the customer's own available account — releasing the hold
 	// back to available, Design Notes) plus a paired "withdrawal.failed" outbox event.
 	SettleFailedWithdrawal(ctx context.Context, withdrawalID string) error
+	// ListStuckCandidates (Story 3.5) returns every withdrawal on chain currently at
+	// WithdrawalStatusBroadcast whose broadcast_attempts.created_at is older than olderThan
+	// AND whose StuckAlertedAt is still nil — DetectStuckWithdrawals' own input set each poll
+	// cycle (Boundaries & Constraints). A withdrawal already alerted is never returned again
+	// (that is what makes the one-time-alert guarantee hold), and a withdrawal not yet
+	// WithdrawalStatusBroadcast (still signed) or already confirmed/failed never qualifies.
+	ListStuckCandidates(ctx context.Context, chain Chain, olderThan time.Duration) ([]Withdrawal, error)
+	// MarkStuckAlerted (Story 3.5) writes exactly one "withdrawal.stuck" outbox event for
+	// withdrawalID and sets its stuck_alerted_at, atomically, in the transaction already open
+	// on ctx (AD-4) — mirroring DepositRepository.OrphanDeposit's own transition-plus-paired-
+	// outbox-event shape. This is deliberately NOT a status transition (Design Notes: a
+	// stuck withdrawal can still resolve to confirmed or failed normally afterward) and posts
+	// no journal entry (no money moves — this is a monitoring signal only). The underlying
+	// UPDATE is scoped to stuck_alerted_at IS NULL, so a caller that (in violation of
+	// ListStuckCandidates' own contract) invoked this twice for the same withdrawal would get
+	// a no-op the second time, never a second outbox event.
+	MarkStuckAlerted(ctx context.Context, withdrawalID string) error
+}
+
+// WatcherLivenessChecker reads whether chain's watcher process is still actively polling
+// (Story 3.5, AD-15's liveness signal) by reusing the existing watcher_cursors table
+// (Story 2.1) rather than a new heartbeat mechanism (Design Notes): the watcher advances
+// this table's "observed" tier row on every successful poll cycle, so a stalled watcher
+// (RPC down, crashed, etc.) stops advancing it. Implemented in internal/adapter/postgres
+// against watcher_cursors directly — a plain read, independent of any transaction on ctx,
+// mirroring WithdrawalThresholdLister's/TokenRegistryLister's own small-repo shape.
+type WatcherLivenessChecker interface {
+	// IsLive returns whether chain's watcher cursor (tier="observed") has advanced within
+	// staleAfter of now. A chain the watcher has never polled at all — no watcher_cursors row
+	// whatsoever — returns false, never true: "never polled" is not "live" (Code Map).
+	IsLive(ctx context.Context, chain Chain, staleAfter time.Duration) (bool, error)
 }
 
 // Signer signs a 32-byte digest and returns a standard 65-byte Ethereum signature

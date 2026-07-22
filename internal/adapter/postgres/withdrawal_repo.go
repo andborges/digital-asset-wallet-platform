@@ -2,10 +2,12 @@ package postgres
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -77,6 +79,32 @@ const (
 	withdrawalConfirmedEventType = "withdrawal.confirmed"
 	withdrawalFailedEventType    = "withdrawal.failed"
 )
+
+// withdrawalStuckEventType is the outbox event_type MarkStuckAlerted writes (Story 3.5) —
+// operator-facing, documented in docs/runbooks/stuck-withdrawals.md. Never paired with a
+// journal entry (Design Notes: no money moves when a withdrawal goes stuck, only a
+// monitoring signal layered on the existing WithdrawalStatusBroadcast status).
+const withdrawalStuckEventType = "withdrawal.stuck"
+
+// withdrawalStuckPayload is the jsonb payload recorded alongside every withdrawalStuckEventType
+// outbox event — carries TxHash (unlike withdrawalRoutedPayload/withdrawalSettledPayload
+// above, neither of which needs it) since the runbook's own first step is "look up this
+// tx_hash on a block explorer or via eth_getTransactionReceipt," and CustomerID/Chain/Asset/
+// Amount/DestinationAddress mirror this file's other outbox payloads' fixed-shape discipline.
+// Status distinguishes the two stuck cases ListStuckCandidates now covers (re-review
+// 2026-07-22): "signed" (TxHash will be empty — never got a broadcast attempt to succeed)
+// vs. "broadcast" (TxHash populated — sent, but not yet confirmed) — the runbook's first
+// diagnostic step depends on knowing which.
+type withdrawalStuckPayload struct {
+	WithdrawalID       string `json:"withdrawalId"`
+	CustomerID         string `json:"customerId"`
+	Chain              string `json:"chain"`
+	Asset              string `json:"asset"`
+	Amount             string `json:"amount"`
+	DestinationAddress string `json:"destinationAddress"`
+	Status             string `json:"status"`
+	TxHash             string `json:"txHash"`
+}
 
 // ErrNoChainNonceState is returned by ClaimApprovedWithdrawal when no chain_nonce_state row
 // exists for the requested chain — a registry gap that should never happen in a correctly
@@ -536,11 +564,14 @@ func (r *WithdrawalRepository) ClaimApprovedWithdrawal(ctx context.Context, chai
 	}, true, nil
 }
 
-// RecordBroadcastTxHash implements core.WithdrawalRepository (Story 3.4): records txHash
-// on both broadcast_attempts and withdrawals (the latter a denormalized read-convenience
-// column, Design Notes) and transitions the withdrawal to WithdrawalStatusBroadcast —
-// called only after TransactionBroadcaster.SendRawTransaction has already succeeded.
-func (r *WithdrawalRepository) RecordBroadcastTxHash(ctx context.Context, withdrawalID, txHash string) error {
+// RecordSignedTx implements core.WithdrawalRepository (Story 3.5): persists txHash and the
+// exact signed transaction bytes (signedTxHex, hex-encoded) onto broadcast_attempts BEFORE
+// any send is ever attempted — withdrawals.status stays WithdrawalStatusSigned, never
+// transitioned here (Boundaries & Constraints' own ordering; MarkBroadcast below is the
+// only method that transitions to WithdrawalStatusBroadcast). Splits Story 3.4's
+// RecordBroadcastTxHash apart because the persist step must now straddle the network send,
+// not follow it.
+func (r *WithdrawalRepository) RecordSignedTx(ctx context.Context, withdrawalID, txHash, signedTxHex string) error {
 	tx := txFromContext(ctx)
 
 	var status string
@@ -554,28 +585,69 @@ func (r *WithdrawalRepository) RecordBroadcastTxHash(ctx context.Context, withdr
 		return fmt.Errorf("%w: withdrawal %s has status %q", core.ErrWithdrawalNotSigned, withdrawalID, status)
 	}
 
-	now := time.Now().UTC()
 	attemptTag, err := tx.Exec(ctx,
-		`UPDATE broadcast_attempts SET tx_hash = $1 WHERE withdrawal_id = $2`,
-		txHash, withdrawalID,
+		`UPDATE broadcast_attempts SET tx_hash = $1, signed_tx = $2 WHERE withdrawal_id = $3`,
+		txHash, signedTxHex, withdrawalID,
 	)
 	if err != nil {
-		return fmt.Errorf("record broadcast attempt tx hash: %w", err)
+		return fmt.Errorf("record signed tx: %w", err)
 	}
 	if attemptTag.RowsAffected() == 0 {
 		// Currently unreachable — ClaimApprovedWithdrawal always inserts exactly one
 		// broadcast_attempts row for this withdrawal_id before it can ever reach
 		// WithdrawalStatusSigned, which the status check above already re-verified inside
-		// this same transaction. Checked anyway (re-review 2026-07-21): without this, a
-		// missing/deleted broadcast_attempts row would let withdrawals.status/tx_hash
-		// advance below while broadcast_attempts — this repository's own documented
-		// source of truth for tx_hash — silently stayed empty.
-		return fmt.Errorf("record broadcast attempt tx hash for withdrawal %s: no broadcast_attempts row found", withdrawalID)
+		// this same transaction. Checked anyway (mirrors Story 3.4's identical check on this
+		// same statement shape): without this, a missing/deleted broadcast_attempts row
+		// would silently record nothing while callers believed the signed bytes were
+		// durably persisted.
+		return fmt.Errorf("record signed tx for withdrawal %s: no broadcast_attempts row found", withdrawalID)
+	}
+	return nil
+}
+
+// MarkBroadcast implements core.WithdrawalRepository (Story 3.5): transitions the
+// withdrawal from WithdrawalStatusSigned to WithdrawalStatusBroadcast, copying
+// broadcast_attempts.tx_hash (already recorded by RecordSignedTx, before any send was
+// attempted) onto the denormalized withdrawals.tx_hash column (Design Notes) — called only
+// after TransactionBroadcaster.SendRawTransaction has succeeded, or failed with an error
+// SignAndBroadcastWithdrawal recognized as "already known"/"nonce too low" (Boundaries &
+// Constraints).
+func (r *WithdrawalRepository) MarkBroadcast(ctx context.Context, withdrawalID string) error {
+	tx := txFromContext(ctx)
+
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM withdrawals WHERE id = $1 FOR UPDATE`, withdrawalID).Scan(&status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: withdrawal %s", core.ErrWithdrawalNotFound, withdrawalID)
+		}
+		return fmt.Errorf("lock withdrawal row: %w", err)
+	}
+	if status != core.WithdrawalStatusSigned {
+		return fmt.Errorf("%w: withdrawal %s has status %q", core.ErrWithdrawalNotSigned, withdrawalID, status)
 	}
 
+	var txHash *string
+	if err := tx.QueryRow(ctx, `SELECT tx_hash FROM broadcast_attempts WHERE withdrawal_id = $1`, withdrawalID).Scan(&txHash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Same "currently unreachable, checked anyway" reasoning as RecordSignedTx's
+			// identical guard above.
+			return fmt.Errorf("mark withdrawal %s broadcast: no broadcast_attempts row found", withdrawalID)
+		}
+		return fmt.Errorf("read broadcast attempt tx hash: %w", err)
+	}
+	if txHash == nil || *txHash == "" {
+		// Defensive: MarkBroadcast's own contract (see its doc comment) is "called only
+		// after RecordSignedTx has already run" — a caller invoking this before that commit
+		// would otherwise silently transition to WithdrawalStatusBroadcast with no tx_hash,
+		// permanently breaking ListBroadcastWithdrawals' own WHERE tx_hash IS NOT NULL filter
+		// for this withdrawal.
+		return fmt.Errorf("mark withdrawal %s broadcast: broadcast_attempts.tx_hash not yet recorded", withdrawalID)
+	}
+
+	now := time.Now().UTC()
 	tag, err := tx.Exec(ctx,
 		`UPDATE withdrawals SET status = $1, tx_hash = $2, updated_at = $3 WHERE id = $4 AND status = $5`,
-		core.WithdrawalStatusBroadcast, txHash, now, withdrawalID, core.WithdrawalStatusSigned,
+		core.WithdrawalStatusBroadcast, *txHash, now, withdrawalID, core.WithdrawalStatusSigned,
 	)
 	if err != nil {
 		return fmt.Errorf("update withdrawal to broadcast: %w", err)
@@ -587,6 +659,105 @@ func (r *WithdrawalRepository) RecordBroadcastTxHash(ctx context.Context, withdr
 		return fmt.Errorf("%w: withdrawal %s status changed concurrently", core.ErrWithdrawalNotSigned, withdrawalID)
 	}
 	return nil
+}
+
+// listSignedWithdrawalsBatchLimit caps how many WithdrawalStatusSigned rows
+// ListSignedWithdrawals fetches and hex-decodes per call (re-review 2026-07-22, adversarial
+// review): SignAndBroadcastWithdrawal.Execute only ever consumes the first row anyway, so an
+// unbounded query paid the full decode cost of the entire signed backlog on every single
+// call — O(n^2) work to drain a backlog of n. A generous, not tightly-tuned cap is enough to
+// bound that cost without turning this into a one-row-at-a-time query (which would let a
+// single always-first, permanently-undecodable row starve every other row behind it forever
+// — see the decode-failure handling below, which already handles that case, but capping the
+// batch size is a separate, complementary fix).
+const listSignedWithdrawalsBatchLimit = 50
+
+// ListSignedWithdrawals implements core.WithdrawalRepository (Story 3.5): a plain read of
+// up to listSignedWithdrawalsBatchLimit withdrawals on chain currently at
+// WithdrawalStatusSigned, joined to its own broadcast_attempts row for
+// nonce/tx_hash/signed_tx — SignAndBroadcastWithdrawal.Execute's own resume set, checked
+// before any new claim (Boundaries & Constraints). signed_tx is stored hex-encoded
+// (RecordSignedTx's own encoding); decoded back to raw bytes here so core never has to know
+// the encoding.
+//
+// Re-review 2026-07-22 (adversarial review): a row whose signed_tx fails to hex-decode is
+// SKIPPED, not treated as a fatal error for the whole call — the original version returned
+// an error for every row in the result set the moment any single one failed to decode,
+// which meant one corrupted/malformed signed_tx (e.g. a hand-edited value during exactly the
+// kind of manual runbook intervention this story's own runbook encourages) would
+// permanently wedge every OTHER signed withdrawal on the chain behind it, since neither
+// resuming nor claiming new work could ever proceed past a listing call that always errors.
+// A skipped row is left exactly as-is in the database (still WithdrawalStatusSigned,
+// stuck_alerted_at still NULL) — DetectStuckWithdrawals' widened coverage of
+// WithdrawalStatusSigned (see ListStuckCandidates) is what eventually surfaces it to an
+// operator, not this method.
+func (r *WithdrawalRepository) ListSignedWithdrawals(ctx context.Context, chain core.Chain) ([]core.Withdrawal, error) {
+	tx := txFromContext(ctx)
+
+	rows, err := tx.Query(ctx,
+		`SELECT w.id, w.customer_id, w.asset, w.amount::text, w.destination_address, w.created_at, ba.nonce, ba.tx_hash, ba.signed_tx
+		 FROM withdrawals w
+		 JOIN broadcast_attempts ba ON ba.withdrawal_id = w.id
+		 WHERE w.chain = $1 AND w.status = $2
+		 ORDER BY w.created_at, w.id
+		 LIMIT $3`,
+		string(chain), core.WithdrawalStatusSigned, listSignedWithdrawalsBatchLimit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list signed withdrawals: %w", err)
+	}
+	defer rows.Close()
+
+	var out []core.Withdrawal
+	for rows.Next() {
+		var (
+			id, customerID, asset, amountText, destinationAddress string
+			createdAt                                             time.Time
+			nonce                                                 int64
+			txHash, signedTxHex                                   *string
+		)
+		if err := rows.Scan(&id, &customerID, &asset, &amountText, &destinationAddress, &createdAt, &nonce, &txHash, &signedTxHex); err != nil {
+			return nil, fmt.Errorf("scan signed withdrawal: %w", err)
+		}
+		amount, ok := new(big.Int).SetString(amountText, 10)
+		if !ok {
+			return nil, fmt.Errorf("parse withdrawal amount %q as integer", amountText)
+		}
+
+		var signedTx []byte
+		if signedTxHex != nil && *signedTxHex != "" {
+			decoded, err := hex.DecodeString(strings.TrimPrefix(*signedTxHex, "0x"))
+			if err != nil {
+				// Skip, don't fail the whole call (see doc comment above) — this row simply
+				// isn't included in this poll's resume set; it stays WithdrawalStatusSigned
+				// and is picked up by stuck-detection instead.
+				continue
+			}
+			signedTx = decoded
+		}
+		var resolvedTxHash string
+		if txHash != nil {
+			resolvedTxHash = *txHash
+		}
+
+		out = append(out, core.Withdrawal{
+			ID:                 id,
+			CustomerID:         customerID,
+			Chain:              chain,
+			Asset:              core.Asset(asset),
+			Amount:             amount,
+			DestinationAddress: destinationAddress,
+			Status:             core.WithdrawalStatusSigned,
+			CreatedAt:          createdAt,
+			Nonce:              &nonce,
+			TxHash:             resolvedTxHash,
+			SignedTx:           signedTx,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate signed withdrawals: %w", err)
+	}
+	return out, nil
 }
 
 // ListBroadcastWithdrawals implements core.WithdrawalRepository (Story 3.4): a plain read
@@ -838,6 +1009,171 @@ func (r *WithdrawalRepository) SettleConfirmedWithdrawal(ctx context.Context, wi
 // credit available (see settleWithdrawal).
 func (r *WithdrawalRepository) SettleFailedWithdrawal(ctx context.Context, withdrawalID string) error {
 	return r.settleWithdrawal(ctx, withdrawalID, core.WithdrawalStatusFailed, withdrawalFailureCauseType, withdrawalFailedEventType, string(core.AccountTypeAvailable), false)
+}
+
+// ListStuckCandidates implements core.WithdrawalRepository (Story 3.5): a plain read of
+// every withdrawal on chain, at EITHER WithdrawalStatusSigned or WithdrawalStatusBroadcast,
+// that has been in that status too long and whose stuck_alerted_at is still NULL —
+// DetectStuckWithdrawals' own input set each poll cycle (Boundaries & Constraints).
+//
+// Re-review 2026-07-22 (both an adversarial and an edge-case review pass independently
+// caught this): the original version of this query only ever watched
+// WithdrawalStatusBroadcast, so a withdrawal parked at WithdrawalStatusSigned — the exact
+// state a persistent resend failure, an unrecognized send-error phrasing, or the liveness
+// gate can leave one in — had ZERO monitoring coverage, directly contradicting this story's
+// own Problem Statement ("no customer's funds may ever be silently lost or frozen"). Fixed
+// by widening this query to also treat a too-long-at-`signed` withdrawal as a stuck
+// candidate.
+//
+// The two statuses use DIFFERENT staleness clocks, not the same column (a second thing the
+// original version got wrong, per the same re-review): a `signed` withdrawal's clock starts
+// at ClaimApprovedWithdrawal time (broadcast_attempts.created_at) — that's genuinely when
+// the "how long has this been trying to get out the door" question starts. A `broadcast`
+// withdrawal's clock must start at the moment MarkBroadcast actually ran (withdrawals.
+// updated_at — nothing else touches that column while a row sits at `broadcast`, since
+// settlement is the only other writer and it always transitions status away from
+// `broadcast` first), NOT at claim time — otherwise a withdrawal that spent a long time
+// stuck at `signed` (blocked behind an earlier resume, or paused by the liveness gate) would
+// be flagged stuck the instant it finally broadcasts, having been on-chain for zero time.
+func (r *WithdrawalRepository) ListStuckCandidates(ctx context.Context, chain core.Chain, olderThan time.Duration) ([]core.Withdrawal, error) {
+	tx := txFromContext(ctx)
+
+	cutoff := time.Now().UTC().Add(-olderThan)
+	rows, err := tx.Query(ctx,
+		`SELECT w.id, w.customer_id, w.asset, w.amount::text, w.destination_address, w.created_at, w.status, w.tx_hash, ba.nonce
+		 FROM withdrawals w
+		 JOIN broadcast_attempts ba ON ba.withdrawal_id = w.id
+		 WHERE w.chain = $1 AND w.stuck_alerted_at IS NULL
+		   AND (
+		     (w.status = $2 AND ba.created_at < $4)
+		     OR (w.status = $3 AND w.updated_at < $4)
+		   )
+		 ORDER BY w.created_at, w.id`,
+		string(chain), core.WithdrawalStatusSigned, core.WithdrawalStatusBroadcast, cutoff,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list stuck candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []core.Withdrawal
+	for rows.Next() {
+		var (
+			id, customerID, asset, amountText, destinationAddress, status string
+			createdAt                                                     time.Time
+			txHash                                                        *string
+			nonce                                                         int64
+		)
+		if err := rows.Scan(&id, &customerID, &asset, &amountText, &destinationAddress, &createdAt, &status, &txHash, &nonce); err != nil {
+			return nil, fmt.Errorf("scan stuck candidate: %w", err)
+		}
+		amount, ok := new(big.Int).SetString(amountText, 10)
+		if !ok {
+			return nil, fmt.Errorf("parse withdrawal amount %q as integer", amountText)
+		}
+		var resolvedTxHash string
+		if txHash != nil {
+			resolvedTxHash = *txHash
+		}
+		out = append(out, core.Withdrawal{
+			ID:                 id,
+			CustomerID:         customerID,
+			Chain:              chain,
+			Asset:              core.Asset(asset),
+			Amount:             amount,
+			DestinationAddress: destinationAddress,
+			Status:             status,
+			CreatedAt:          createdAt,
+			TxHash:             resolvedTxHash,
+			Nonce:              &nonce,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stuck candidates: %w", err)
+	}
+	return out, nil
+}
+
+// MarkStuckAlerted implements core.WithdrawalRepository (Story 3.5): writes exactly one
+// "withdrawal.stuck" outbox event for withdrawalID and sets its stuck_alerted_at, atomically
+// — mirroring DepositRepository.OrphanDeposit's own transition-plus-paired-outbox-event
+// shape, except this never transitions withdrawals.status (Design Notes: a stuck withdrawal
+// can still resolve to confirmed or failed normally afterward) and posts no journal entry
+// (no money moves — this is a monitoring signal only).
+//
+// Re-review 2026-07-22 (adversarial review): the guard against a double-alert is now
+// checked and set BEFORE the outbox event is ever inserted, not after — the once-only
+// guarantee is self-evident from statement order alone, rather than depending on the
+// surrounding caller always wrapping this in one transaction that happens to roll back
+// everything (including an already-inserted outbox row) on a later error.
+func (r *WithdrawalRepository) MarkStuckAlerted(ctx context.Context, withdrawalID string) error {
+	tx := txFromContext(ctx)
+
+	var customerID, chain, asset, amountText, destinationAddress, status string
+	var txHash *string
+	var alreadyAlerted bool
+	if err := tx.QueryRow(ctx,
+		`SELECT customer_id, chain, asset, amount::text, destination_address, status, tx_hash, stuck_alerted_at IS NOT NULL FROM withdrawals WHERE id = $1 FOR UPDATE`,
+		withdrawalID,
+	).Scan(&customerID, &chain, &asset, &amountText, &destinationAddress, &status, &txHash, &alreadyAlerted); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: withdrawal %s", core.ErrWithdrawalNotFound, withdrawalID)
+		}
+		return fmt.Errorf("lock withdrawal row: %w", err)
+	}
+	if alreadyAlerted {
+		// Currently unreachable given ListStuckCandidates' own WHERE stuck_alerted_at IS NULL
+		// filter and AD-11's single-broadcaster-process-per-chain guarantee — checked anyway
+		// (mirrors every other guard check in this file): failing loud HERE, before any write,
+		// is what makes "exactly one alert, never re-alerted" true by construction rather than
+		// by depending on statement ordering below.
+		return fmt.Errorf("withdrawal %s already marked stuck-alerted", withdrawalID)
+	}
+
+	now := time.Now().UTC()
+	tag, err := tx.Exec(ctx,
+		`UPDATE withdrawals SET stuck_alerted_at = $1 WHERE id = $2 AND stuck_alerted_at IS NULL`,
+		now, withdrawalID,
+	)
+	if err != nil {
+		return fmt.Errorf("set stuck_alerted_at: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Same "currently unreachable, checked anyway" reasoning as the read-side guard
+		// above — this WHERE clause re-verifies the identical condition inside the same
+		// locked transaction, so the two checks can only ever agree.
+		return fmt.Errorf("withdrawal %s already marked stuck-alerted", withdrawalID)
+	}
+
+	var resolvedTxHash string
+	if txHash != nil {
+		resolvedTxHash = *txHash
+	}
+	payload, err := json.Marshal(withdrawalStuckPayload{
+		WithdrawalID:       withdrawalID,
+		CustomerID:         customerID,
+		Chain:              chain,
+		Asset:              asset,
+		Amount:             amountText,
+		DestinationAddress: destinationAddress,
+		Status:             status,
+		TxHash:             resolvedTxHash,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal %s outbox payload: %w", withdrawalStuckEventType, err)
+	}
+	eventID, err := uuid.NewV7()
+	if err != nil {
+		return fmt.Errorf("generate outbox event id: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO outbox_events (id, event_type, payload, created_at) VALUES ($1, $2, $3, $4)`,
+		eventID.String(), withdrawalStuckEventType, payload, now,
+	); err != nil {
+		return fmt.Errorf("insert %s outbox event: %w", withdrawalStuckEventType, err)
+	}
+
+	return nil
 }
 
 var _ core.WithdrawalRepository = (*WithdrawalRepository)(nil)

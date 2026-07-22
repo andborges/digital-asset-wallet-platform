@@ -3,9 +3,11 @@ package core_test
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
 )
@@ -38,10 +40,22 @@ type fakeSignAndBroadcastRepo struct {
 	claimErr    error
 	claimCalls  int
 
-	recordErr       error
-	recordCalls     int
-	gotRecordID     string
-	gotRecordTxHash string
+	// listSignedResult/listSignedErr back ListSignedWithdrawals (Story 3.5's own resume
+	// set) — deliberately named distinctly from listResult/listErr below (which remain
+	// ListBroadcastWithdrawals' own fields, unchanged, since poll_withdrawal_receipts_test.go
+	// already references them by that name).
+	listSignedResult []core.Withdrawal
+	listSignedErr    error
+	listSignedCalls  int
+
+	recordSignedErr       error
+	recordSignedCalls     int
+	gotRecordSignedID     string
+	gotRecordSignedTxHash string
+	gotRecordSignedTxHex  string
+
+	markBroadcastErr   error
+	markBroadcastCalls []string
 
 	listResult []core.Withdrawal
 	listErr    error
@@ -54,6 +68,16 @@ type fakeSignAndBroadcastRepo struct {
 	settleFailedErr      error
 	settleConfirmedCalls []string
 	settleFailedCalls    []string
+
+	listStuckResult       []core.Withdrawal
+	listStuckErr          error
+	gotListStuckOlderThan time.Duration
+
+	// markStuckErrByID, when it has an entry for a given withdrawal id, overrides
+	// markStuckErr for that one call — mirrors settleErrByID's identical purpose.
+	markStuckErrByID map[string]error
+	markStuckErr     error
+	markStuckCalls   []string
 }
 
 func (f *fakeSignAndBroadcastRepo) CreateWithdrawal(context.Context, core.WithdrawalRequest, *big.Int, string) (core.Withdrawal, error) {
@@ -69,10 +93,20 @@ func (f *fakeSignAndBroadcastRepo) ClaimApprovedWithdrawal(_ context.Context, _ 
 	return f.claimResult, f.claimOK, f.claimErr
 }
 
-func (f *fakeSignAndBroadcastRepo) RecordBroadcastTxHash(_ context.Context, id, txHash string) error {
-	f.recordCalls++
-	f.gotRecordID, f.gotRecordTxHash = id, txHash
-	return f.recordErr
+func (f *fakeSignAndBroadcastRepo) RecordSignedTx(_ context.Context, id, txHash, signedTxHex string) error {
+	f.recordSignedCalls++
+	f.gotRecordSignedID, f.gotRecordSignedTxHash, f.gotRecordSignedTxHex = id, txHash, signedTxHex
+	return f.recordSignedErr
+}
+
+func (f *fakeSignAndBroadcastRepo) MarkBroadcast(_ context.Context, id string) error {
+	f.markBroadcastCalls = append(f.markBroadcastCalls, id)
+	return f.markBroadcastErr
+}
+
+func (f *fakeSignAndBroadcastRepo) ListSignedWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
+	f.listSignedCalls++
+	return f.listSignedResult, f.listSignedErr
 }
 
 func (f *fakeSignAndBroadcastRepo) ListBroadcastWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
@@ -97,6 +131,21 @@ func (f *fakeSignAndBroadcastRepo) SettleFailedWithdrawal(_ context.Context, id 
 		}
 	}
 	return f.settleFailedErr
+}
+
+func (f *fakeSignAndBroadcastRepo) ListStuckCandidates(_ context.Context, _ core.Chain, olderThan time.Duration) ([]core.Withdrawal, error) {
+	f.gotListStuckOlderThan = olderThan
+	return f.listStuckResult, f.listStuckErr
+}
+
+func (f *fakeSignAndBroadcastRepo) MarkStuckAlerted(_ context.Context, id string) error {
+	f.markStuckCalls = append(f.markStuckCalls, id)
+	if f.markStuckErrByID != nil {
+		if err, ok := f.markStuckErrByID[id]; ok {
+			return err
+		}
+	}
+	return f.markStuckErr
 }
 
 // fakeSigner is a test double for core.Signer.
@@ -197,18 +246,21 @@ func (f *fakeBroadcaster) GetFinalizedReceipt(_ context.Context, chain core.Chai
 var _ core.TransactionBroadcaster = (*fakeBroadcaster)(nil)
 var _ core.Signer = (*fakeSigner)(nil)
 
-func TestSignAndBroadcastWithdrawal_Execute_NothingToClaim(t *testing.T) {
+func TestSignAndBroadcastWithdrawal_Execute_NothingToResumeOrClaim(t *testing.T) {
 	repo := &fakeSignAndBroadcastRepo{claimOK: false}
 	broadcaster := &fakeBroadcaster{}
 	txBeginner := &recordingTxBeginner{}
 	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
 
-	claimed, err := uc.Execute(context.Background(), core.ChainBase)
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
 	if claimed {
-		t.Fatal("claimed = true, want false when nothing was approved to claim")
+		t.Fatal("claimed = true, want false when nothing was resumable or approved to claim")
+	}
+	if repo.listSignedCalls != 1 {
+		t.Fatalf("listSignedCalls = %d, want 1 (resume is always checked first)", repo.listSignedCalls)
 	}
 	if repo.claimCalls != 1 {
 		t.Fatalf("claimCalls = %d, want 1", repo.claimCalls)
@@ -216,11 +268,100 @@ func TestSignAndBroadcastWithdrawal_Execute_NothingToClaim(t *testing.T) {
 	if broadcaster.buildCalls != 0 {
 		t.Fatal("BuildUnsignedWithdrawal must not be called when nothing was claimed")
 	}
-	if len(txBeginner.txs) != 1 {
-		t.Fatalf("opened %d transactions, want exactly 1 (the claim attempt)", len(txBeginner.txs))
+	// [0] the list-signed read, [1] the claim attempt — both roll back, nothing to commit.
+	if len(txBeginner.txs) != 2 {
+		t.Fatalf("opened %d transactions, want exactly 2 (list-signed, then claim)", len(txBeginner.txs))
 	}
-	if txBeginner.txs[0].committed || !txBeginner.txs[0].rolledBack {
-		t.Fatal("the claim transaction should roll back, never commit, when nothing was claimed")
+	for i, tx := range txBeginner.txs {
+		if tx.committed || !tx.rolledBack {
+			t.Fatalf("transaction %d should roll back, never commit, when nothing was resumed or claimed", i)
+		}
+	}
+}
+
+func TestSignAndBroadcastWithdrawal_Execute_ListSignedError(t *testing.T) {
+	repo := &fakeSignAndBroadcastRepo{listSignedErr: errors.New("db unavailable")}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, &fakeBroadcaster{}, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
+	if err == nil {
+		t.Fatal("err = nil, want a wrapped list-signed error")
+	}
+	if claimed {
+		t.Fatal("claimed = true, want false on a list-signed error")
+	}
+	if repo.claimCalls != 0 {
+		t.Fatal("ClaimApprovedWithdrawal must not be called when listing signed withdrawals itself failed")
+	}
+}
+
+// TestSignAndBroadcastWithdrawal_Execute_AllowClaimFalse_NothingToResume_NeverClaims proves
+// allowClaim's own contract directly (re-review 2026-07-22, both an adversarial and an
+// edge-case review pass independently flagged the original version's lack of this
+// distinction): with nothing resumable and allowClaim=false (the broadcaster's liveness
+// gate, cmd/walletd's runBroadcaster, reporting the watcher cursor is stale), Execute must
+// return claimed=false, err=nil WITHOUT ever calling ClaimApprovedWithdrawal — claiming
+// allocates a brand-new nonce, exactly what the liveness gate exists to prevent.
+func TestSignAndBroadcastWithdrawal_Execute_AllowClaimFalse_NothingToResume_NeverClaims(t *testing.T) {
+	repo := &fakeSignAndBroadcastRepo{}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, &fakeBroadcaster{}, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, false)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if claimed {
+		t.Fatal("claimed = true, want false")
+	}
+	if repo.claimCalls != 0 {
+		t.Fatalf("claimCalls = %d, want 0 — allowClaim=false must never fall back to ClaimApprovedWithdrawal", repo.claimCalls)
+	}
+	// Only the list-signed read happens; no claim attempt is ever opened.
+	if len(txBeginner.txs) != 1 {
+		t.Fatalf("opened %d transactions, want exactly 1 (list-signed only)", len(txBeginner.txs))
+	}
+}
+
+// TestSignAndBroadcastWithdrawal_Execute_AllowClaimFalse_StillResumes proves the other half
+// of allowClaim's contract: a stale liveness gate (allowClaim=false) must NOT block
+// resuming an already-signed withdrawal — resuming allocates no new nonce and strands
+// nothing new, so it proceeds exactly as it would with allowClaim=true.
+func TestSignAndBroadcastWithdrawal_Execute_AllowClaimFalse_StillResumes(t *testing.T) {
+	nonce := int64(9)
+	persistedSignedTx := []byte("already-signed-bytes")
+	resumed := core.Withdrawal{
+		ID:                 "withdrawal-resume-live-gate",
+		Chain:              core.ChainBase,
+		Asset:              core.AssetETH,
+		Amount:             big.NewInt(500),
+		DestinationAddress: "0xabc",
+		Status:             core.WithdrawalStatusSigned,
+		Nonce:              &nonce,
+		TxHash:             "0xalreadyhash",
+		SignedTx:           persistedSignedTx,
+	}
+	repo := &fakeSignAndBroadcastRepo{listSignedResult: []core.Withdrawal{resumed}}
+	broadcaster := &fakeBroadcaster{}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, false)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !claimed {
+		t.Fatal("claimed = false, want true — resuming must proceed even when allowClaim is false")
+	}
+	if repo.claimCalls != 0 {
+		t.Fatal("ClaimApprovedWithdrawal must not be called — a resumable withdrawal already existed")
+	}
+	if broadcaster.sendCalls != 1 || !bytes.Equal(broadcaster.gotSendTx, persistedSignedTx) {
+		t.Fatal("SendRawTransaction must still be called with the already-persisted signed bytes despite allowClaim=false")
+	}
+	if len(repo.markBroadcastCalls) != 1 || repo.markBroadcastCalls[0] != resumed.ID {
+		t.Fatalf("markBroadcastCalls = %v, want [%q]", repo.markBroadcastCalls, resumed.ID)
 	}
 }
 
@@ -229,19 +370,23 @@ func TestSignAndBroadcastWithdrawal_Execute_ClaimError(t *testing.T) {
 	txBeginner := &recordingTxBeginner{}
 	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, &fakeBroadcaster{}, txBeginner)
 
-	claimed, err := uc.Execute(context.Background(), core.ChainBase)
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
 	if err == nil {
 		t.Fatal("err = nil, want a wrapped claim error")
 	}
 	if claimed {
 		t.Fatal("claimed = true, want false on a claim error")
 	}
-	if len(txBeginner.txs) != 1 || !txBeginner.txs[0].rolledBack {
+	if len(txBeginner.txs) != 2 || !txBeginner.txs[1].rolledBack {
 		t.Fatal("the claim transaction should roll back on a claim error")
 	}
 }
 
-func TestSignAndBroadcastWithdrawal_Execute_HappyPath(t *testing.T) {
+// TestSignAndBroadcastWithdrawal_Execute_FreshClaim_HappyPath exercises Story 3.5's fresh-
+// claim branch: nothing to resume, so ClaimApprovedWithdrawal runs, followed by the full
+// build -> sign -> assemble -> RecordSignedTx -> send -> MarkBroadcast pipeline — with
+// RecordSignedTx now committing BEFORE the send call (Boundaries & Constraints), not after.
+func TestSignAndBroadcastWithdrawal_Execute_FreshClaim_HappyPath(t *testing.T) {
 	nonce := int64(7)
 	withdrawal := core.Withdrawal{
 		ID:                 "withdrawal-1",
@@ -264,7 +409,7 @@ func TestSignAndBroadcastWithdrawal_Execute_HappyPath(t *testing.T) {
 	txBeginner := &recordingTxBeginner{}
 	uc := core.NewSignAndBroadcastWithdrawal(repo, signer, broadcaster, txBeginner)
 
-	claimed, err := uc.Execute(context.Background(), core.ChainBase)
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -290,19 +435,33 @@ func TestSignAndBroadcastWithdrawal_Execute_HappyPath(t *testing.T) {
 		t.Fatal("AssembleSignedTx was not called with the unsigned tx bytes and signature this call produced")
 	}
 
+	if repo.recordSignedCalls != 1 || repo.gotRecordSignedID != withdrawal.ID || repo.gotRecordSignedTxHash != broadcaster.assembleTxHash {
+		t.Fatalf("RecordSignedTx called with (%q, %q), want (%q, %q)", repo.gotRecordSignedID, repo.gotRecordSignedTxHash, withdrawal.ID, broadcaster.assembleTxHash)
+	}
+	if wantHex := hex.EncodeToString(broadcaster.assembleSignedTx); repo.gotRecordSignedTxHex != wantHex {
+		t.Fatalf("RecordSignedTx signedTxHex = %q, want %q (hex of the assembled signed bytes)", repo.gotRecordSignedTxHex, wantHex)
+	}
+
 	if broadcaster.sendCalls != 1 || broadcaster.gotSendChain != core.ChainBase || !bytes.Equal(broadcaster.gotSendTx, broadcaster.assembleSignedTx) {
 		t.Fatal("SendRawTransaction was not called with the assembled signed tx bytes")
 	}
 
-	if repo.recordCalls != 1 || repo.gotRecordID != withdrawal.ID || repo.gotRecordTxHash != broadcaster.assembleTxHash {
-		t.Fatalf("RecordBroadcastTxHash called with (%q, %q), want (%q, %q)", repo.gotRecordID, repo.gotRecordTxHash, withdrawal.ID, broadcaster.assembleTxHash)
+	if len(repo.markBroadcastCalls) != 1 || repo.markBroadcastCalls[0] != withdrawal.ID {
+		t.Fatalf("markBroadcastCalls = %v, want [%q]", repo.markBroadcastCalls, withdrawal.ID)
 	}
 
-	if len(txBeginner.txs) != 2 {
-		t.Fatalf("opened %d transactions, want exactly 2 (claim, then record-broadcast)", len(txBeginner.txs))
+	// [0] list-signed (rolled back, nothing resumable), [1] claim (commit), [2] record-signed
+	// (commit — BEFORE the send call above), [3] mark-broadcast (commit).
+	if len(txBeginner.txs) != 4 {
+		t.Fatalf("opened %d transactions, want exactly 4 (list-signed, claim, record-signed, mark-broadcast)", len(txBeginner.txs))
 	}
-	if !txBeginner.txs[0].committed || !txBeginner.txs[1].committed {
-		t.Fatal("both the claim and the record-broadcast transactions should commit on the happy path")
+	if txBeginner.txs[0].committed {
+		t.Fatal("the list-signed transaction should never commit")
+	}
+	for i := 1; i < 4; i++ {
+		if !txBeginner.txs[i].committed {
+			t.Fatalf("transaction %d should commit on the happy path", i)
+		}
 	}
 }
 
@@ -314,7 +473,7 @@ func TestSignAndBroadcastWithdrawal_Execute_BuildFails_ClaimStillCommitted(t *te
 	txBeginner := &recordingTxBeginner{}
 	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
 
-	claimed, err := uc.Execute(context.Background(), core.ChainBase)
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
 	if err == nil {
 		t.Fatal("err = nil, want a wrapped build error")
 	}
@@ -324,14 +483,16 @@ func TestSignAndBroadcastWithdrawal_Execute_BuildFails_ClaimStillCommitted(t *te
 	if !claimed {
 		t.Fatal("claimed = false, want true — the withdrawal was durably claimed before the build failure")
 	}
-	if len(txBeginner.txs) != 1 {
-		t.Fatalf("opened %d transactions, want exactly 1 (only the claim — a build failure never opens a record-broadcast transaction)", len(txBeginner.txs))
+	// [0] list-signed (rolled back), [1] claim (commit) — a build failure never opens a
+	// record-signed-tx transaction.
+	if len(txBeginner.txs) != 2 {
+		t.Fatalf("opened %d transactions, want exactly 2 (list-signed, then claim)", len(txBeginner.txs))
 	}
-	if !txBeginner.txs[0].committed {
+	if !txBeginner.txs[1].committed {
 		t.Fatal("the claim transaction should have committed BEFORE the build call ran")
 	}
-	if repo.recordCalls != 0 {
-		t.Fatal("RecordBroadcastTxHash must not be called when BuildUnsignedWithdrawal fails")
+	if repo.recordSignedCalls != 0 {
+		t.Fatal("RecordSignedTx must not be called when BuildUnsignedWithdrawal fails")
 	}
 }
 
@@ -344,7 +505,7 @@ func TestSignAndBroadcastWithdrawal_Execute_SignFails(t *testing.T) {
 	txBeginner := &recordingTxBeginner{}
 	uc := core.NewSignAndBroadcastWithdrawal(repo, signer, broadcaster, txBeginner)
 
-	claimed, err := uc.Execute(context.Background(), core.ChainBase)
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
 	if err == nil {
 		t.Fatal("err = nil, want a wrapped sign error")
 	}
@@ -354,15 +515,20 @@ func TestSignAndBroadcastWithdrawal_Execute_SignFails(t *testing.T) {
 	if broadcaster.assembleCalls != 0 || broadcaster.sendCalls != 0 {
 		t.Fatal("AssembleSignedTx/SendRawTransaction must not be called when Sign fails")
 	}
-	if repo.recordCalls != 0 {
-		t.Fatal("RecordBroadcastTxHash must not be called when Sign fails")
+	if repo.recordSignedCalls != 0 {
+		t.Fatal("RecordSignedTx must not be called when Sign fails")
 	}
-	if len(txBeginner.txs) != 1 {
-		t.Fatalf("opened %d transactions, want exactly 1", len(txBeginner.txs))
+	if len(txBeginner.txs) != 2 {
+		t.Fatalf("opened %d transactions, want exactly 2 (list-signed, then claim)", len(txBeginner.txs))
 	}
 }
 
-func TestSignAndBroadcastWithdrawal_Execute_SendFails_NoTxHashRecorded(t *testing.T) {
+// TestSignAndBroadcastWithdrawal_Execute_SendFails_LeavesSignedWithSignedTxPersisted proves
+// Story 3.5's core restructuring: RecordSignedTx now commits BEFORE the send is attempted,
+// so a send failure leaves the signed bytes already durably persisted — never re-signed on
+// the next resume — and MarkBroadcast is never called (I/O & Edge-Case Matrix: "stays
+// signed; retried next poll; no immediate failed").
+func TestSignAndBroadcastWithdrawal_Execute_SendFails_LeavesSignedWithSignedTxPersisted(t *testing.T) {
 	nonce := int64(1)
 	withdrawal := core.Withdrawal{ID: "withdrawal-1", DestinationAddress: "0xabc", Amount: big.NewInt(1), Nonce: &nonce}
 	repo := &fakeSignAndBroadcastRepo{claimResult: withdrawal, claimOK: true}
@@ -375,17 +541,217 @@ func TestSignAndBroadcastWithdrawal_Execute_SendFails_NoTxHashRecorded(t *testin
 	txBeginner := &recordingTxBeginner{}
 	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
 
-	claimed, err := uc.Execute(context.Background(), core.ChainBase)
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
 	if err == nil {
 		t.Fatal("err = nil, want a wrapped send error")
 	}
 	if !claimed {
 		t.Fatal("claimed = false, want true")
 	}
-	if repo.recordCalls != 0 {
-		t.Fatal("RecordBroadcastTxHash must not be called when SendRawTransaction fails — I/O matrix: the withdrawal stays 'signed' with no tx_hash")
+	if repo.recordSignedCalls != 1 {
+		t.Fatal("RecordSignedTx SHOULD have been called (and committed) before the send attempt — Story 3.5's own restructuring")
 	}
-	if len(txBeginner.txs) != 1 {
-		t.Fatalf("opened %d transactions, want exactly 1 (no record-broadcast transaction on a send failure)", len(txBeginner.txs))
+	if len(repo.markBroadcastCalls) != 0 {
+		t.Fatal("MarkBroadcast must not be called when SendRawTransaction fails with an unrecognized error")
+	}
+	// [0] list-signed, [1] claim, [2] record-signed — no mark-broadcast transaction on a
+	// send failure that isn't recognized as "already known"/"nonce too low".
+	if len(txBeginner.txs) != 3 {
+		t.Fatalf("opened %d transactions, want exactly 3 (list-signed, claim, record-signed)", len(txBeginner.txs))
+	}
+	if !txBeginner.txs[2].committed {
+		t.Fatal("the record-signed-tx transaction should still commit even though the subsequent send failed")
+	}
+}
+
+// TestSignAndBroadcastWithdrawal_Execute_Resume_ResendsPersistedBytesWithoutResigning proves
+// the resume path (Story 3.5's core acceptance criterion, AC3): a withdrawal already
+// ListSignedWithdrawals-returned with a non-empty SignedTx skips build/sign/assemble
+// entirely and resends those EXACT bytes.
+func TestSignAndBroadcastWithdrawal_Execute_Resume_ResendsPersistedBytesWithoutResigning(t *testing.T) {
+	nonce := int64(3)
+	persistedSignedTx := []byte("already-signed-bytes")
+	resumed := core.Withdrawal{
+		ID:                 "withdrawal-resume-1",
+		Chain:              core.ChainBase,
+		Asset:              core.AssetETH,
+		Amount:             big.NewInt(500),
+		DestinationAddress: "0xabc",
+		Status:             core.WithdrawalStatusSigned,
+		Nonce:              &nonce,
+		TxHash:             "0xalreadyhash",
+		SignedTx:           persistedSignedTx,
+	}
+	repo := &fakeSignAndBroadcastRepo{listSignedResult: []core.Withdrawal{resumed}}
+	signer := &fakeSigner{}
+	broadcaster := &fakeBroadcaster{}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, signer, broadcaster, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !claimed {
+		t.Fatal("claimed = false, want true")
+	}
+	if repo.claimCalls != 0 {
+		t.Fatal("ClaimApprovedWithdrawal must not be called when a resumable signed withdrawal already exists")
+	}
+	if broadcaster.buildCalls != 0 || signer.calls != 0 || broadcaster.assembleCalls != 0 {
+		t.Fatal("build/sign/assemble must NEVER run on the resume path — resending must never re-sign")
+	}
+	if repo.recordSignedCalls != 0 {
+		t.Fatal("RecordSignedTx must not be called again on the resume path — the bytes are already persisted")
+	}
+	if broadcaster.sendCalls != 1 || !bytes.Equal(broadcaster.gotSendTx, persistedSignedTx) {
+		t.Fatal("SendRawTransaction must be called with the exact already-persisted signed bytes")
+	}
+	if len(repo.markBroadcastCalls) != 1 || repo.markBroadcastCalls[0] != resumed.ID {
+		t.Fatalf("markBroadcastCalls = %v, want [%q]", repo.markBroadcastCalls, resumed.ID)
+	}
+	// [0] list-signed (commit not required — it's a read), [1] mark-broadcast (commit).
+	if len(txBeginner.txs) != 2 {
+		t.Fatalf("opened %d transactions, want exactly 2 (list-signed, mark-broadcast)", len(txBeginner.txs))
+	}
+	if !txBeginner.txs[1].committed {
+		t.Fatal("the mark-broadcast transaction should commit")
+	}
+}
+
+// TestSignAndBroadcastWithdrawal_Execute_Resume_NoSignedTxYet_RunsFullPipeline covers the
+// OTHER resume case (I/O & Edge-Case Matrix: "Crash after persisting signed_tx, before the
+// send call returns" is the with-SignedTx case above; this is the earlier crash point —
+// claimed, but interrupted before signing/RecordSignedTx ever ran): resumed via
+// ListSignedWithdrawals (never re-claimed) but with an empty SignedTx, so it runs the exact
+// same build/sign/assemble/RecordSignedTx/send pipeline a fresh claim would.
+func TestSignAndBroadcastWithdrawal_Execute_Resume_NoSignedTxYet_RunsFullPipeline(t *testing.T) {
+	nonce := int64(4)
+	resumed := core.Withdrawal{
+		ID:                 "withdrawal-resume-2",
+		Chain:              core.ChainBase,
+		Asset:              core.AssetETH,
+		Amount:             big.NewInt(500),
+		DestinationAddress: "0xabc",
+		Status:             core.WithdrawalStatusSigned,
+		Nonce:              &nonce,
+	}
+	repo := &fakeSignAndBroadcastRepo{listSignedResult: []core.Withdrawal{resumed}}
+	signer := &fakeSigner{sig: [65]byte{9}}
+	broadcaster := &fakeBroadcaster{
+		buildUnsigned:    []byte("unsigned"),
+		assembleSignedTx: []byte("signed"),
+		assembleTxHash:   "0xresumehash",
+	}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, signer, broadcaster, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !claimed {
+		t.Fatal("claimed = false, want true")
+	}
+	if repo.claimCalls != 0 {
+		t.Fatal("ClaimApprovedWithdrawal must not be called — the withdrawal was already resumed via ListSignedWithdrawals")
+	}
+	if broadcaster.buildCalls != 1 || signer.calls != 1 || broadcaster.assembleCalls != 1 {
+		t.Fatal("build/sign/assemble must run when the resumed withdrawal has no SignedTx yet")
+	}
+	if repo.recordSignedCalls != 1 {
+		t.Fatal("RecordSignedTx must be called for a resumed withdrawal with no SignedTx yet")
+	}
+	if len(repo.markBroadcastCalls) != 1 || repo.markBroadcastCalls[0] != resumed.ID {
+		t.Fatalf("markBroadcastCalls = %v, want [%q]", repo.markBroadcastCalls, resumed.ID)
+	}
+}
+
+// TestSignAndBroadcastWithdrawal_Execute_Resend_AlreadyKnownError_StillMarksBroadcast and
+// its "nonce too low" sibling prove Boundaries & Constraints' own idempotency rule: a resend
+// (or fresh send) erroring with either recognized phrase still transitions to broadcast,
+// exactly as if the send had returned no error at all.
+func TestSignAndBroadcastWithdrawal_Execute_Resend_AlreadyKnownError_StillMarksBroadcast(t *testing.T) {
+	for _, errText := range []string{"already known", "ALREADY KNOWN", "replacement transaction underpriced: already known"} {
+		t.Run(errText, func(t *testing.T) {
+			nonce := int64(1)
+			resumed := core.Withdrawal{ID: "withdrawal-1", Nonce: &nonce, SignedTx: []byte("bytes")}
+			repo := &fakeSignAndBroadcastRepo{listSignedResult: []core.Withdrawal{resumed}}
+			broadcaster := &fakeBroadcaster{sendErr: errors.New(errText)}
+			txBeginner := &recordingTxBeginner{}
+			uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
+
+			claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
+			if err != nil {
+				t.Fatalf("err = %v, want nil — an 'already known' send error is treated as success", err)
+			}
+			if !claimed {
+				t.Fatal("claimed = false, want true")
+			}
+			if len(repo.markBroadcastCalls) != 1 || repo.markBroadcastCalls[0] != resumed.ID {
+				t.Fatalf("markBroadcastCalls = %v, want [%q]", repo.markBroadcastCalls, resumed.ID)
+			}
+		})
+	}
+}
+
+func TestSignAndBroadcastWithdrawal_Execute_Resend_NonceTooLowError_StillMarksBroadcast(t *testing.T) {
+	nonce := int64(1)
+	resumed := core.Withdrawal{ID: "withdrawal-1", Nonce: &nonce, SignedTx: []byte("bytes")}
+	repo := &fakeSignAndBroadcastRepo{listSignedResult: []core.Withdrawal{resumed}}
+	broadcaster := &fakeBroadcaster{sendErr: errors.New("nonce too low")}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
+	if err != nil {
+		t.Fatalf("err = %v, want nil — a 'nonce too low' send error is treated as success", err)
+	}
+	if !claimed {
+		t.Fatal("claimed = false, want true")
+	}
+	if len(repo.markBroadcastCalls) != 1 || repo.markBroadcastCalls[0] != resumed.ID {
+		t.Fatalf("markBroadcastCalls = %v, want [%q]", repo.markBroadcastCalls, resumed.ID)
+	}
+}
+
+// TestSignAndBroadcastWithdrawal_Execute_Resend_OtherError_LeavesSignedNoMarkBroadcast
+// proves the negative: an unrecognized send error on resend leaves the withdrawal at
+// signed, never calling MarkBroadcast — Boundaries & Constraints' own "any OTHER send error
+// just returns without changing status."
+func TestSignAndBroadcastWithdrawal_Execute_Resend_OtherError_LeavesSignedNoMarkBroadcast(t *testing.T) {
+	nonce := int64(1)
+	resumed := core.Withdrawal{ID: "withdrawal-1", Nonce: &nonce, SignedTx: []byte("bytes")}
+	repo := &fakeSignAndBroadcastRepo{listSignedResult: []core.Withdrawal{resumed}}
+	broadcaster := &fakeBroadcaster{sendErr: errors.New("connection reset by peer")}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
+	if err == nil {
+		t.Fatal("err = nil, want a wrapped send error")
+	}
+	if !claimed {
+		t.Fatal("claimed = false, want true")
+	}
+	if len(repo.markBroadcastCalls) != 0 {
+		t.Fatal("MarkBroadcast must not be called on an unrecognized send error")
+	}
+}
+
+func TestSignAndBroadcastWithdrawal_Execute_MarkBroadcastFails(t *testing.T) {
+	nonce := int64(1)
+	resumed := core.Withdrawal{ID: "withdrawal-1", Nonce: &nonce, SignedTx: []byte("bytes")}
+	repo := &fakeSignAndBroadcastRepo{listSignedResult: []core.Withdrawal{resumed}, markBroadcastErr: errors.New("db unavailable")}
+	broadcaster := &fakeBroadcaster{}
+	txBeginner := &recordingTxBeginner{}
+	uc := core.NewSignAndBroadcastWithdrawal(repo, &fakeSigner{}, broadcaster, txBeginner)
+
+	claimed, err := uc.Execute(context.Background(), core.ChainBase, true)
+	if err == nil {
+		t.Fatal("err = nil, want a wrapped mark-broadcast error")
+	}
+	if !claimed {
+		t.Fatal("claimed = false, want true")
 	}
 }

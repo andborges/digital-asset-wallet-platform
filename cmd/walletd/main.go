@@ -49,6 +49,15 @@ const (
 	// defaultBroadcasterPollInterval is how often the broadcaster subcommand runs one
 	// claim-and-advance-then-poll-receipts cycle when BROADCASTER_POLL_INTERVAL is unset.
 	defaultBroadcasterPollInterval = 5 * time.Second
+	// defaultWithdrawalStuckThreshold is how long a withdrawal may sit at
+	// WithdrawalStatusBroadcast without confirming before DetectStuckWithdrawals writes its
+	// one-time "withdrawal.stuck" outbox event, when WITHDRAWAL_STUCK_THRESHOLD is unset
+	// (Story 3.5, Boundaries & Constraints).
+	defaultWithdrawalStuckThreshold = 30 * time.Minute
+	// defaultLivenessStalenessMultiplier is how liveness staleness threshold's own default is
+	// derived from the watcher's own poll interval when LIVENESS_STALENESS_THRESHOLD is unset
+	// (Story 3.5, Boundaries & Constraints: "default 3x WATCHER_POLL_INTERVAL").
+	defaultLivenessStalenessMultiplier = 3
 )
 
 func main() {
@@ -514,6 +523,44 @@ func runBroadcaster(logger *slog.Logger, args []string) error {
 		pollInterval = parsed
 	}
 
+	// Story 3.5: WITHDRAWAL_STUCK_THRESHOLD, mirroring BROADCASTER_POLL_INTERVAL's exact
+	// parsing/defaulting pattern above.
+	stuckThreshold := defaultWithdrawalStuckThreshold
+	if v := os.Getenv("WITHDRAWAL_STUCK_THRESHOLD"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("WITHDRAWAL_STUCK_THRESHOLD must be a valid duration (e.g. \"30m\"), got %q: %w", v, err)
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("WITHDRAWAL_STUCK_THRESHOLD must be a positive duration, got %q", v)
+		}
+		stuckThreshold = parsed
+	}
+
+	// Story 3.5: LIVENESS_STALENESS_THRESHOLD, same parsing/defaulting pattern — its own
+	// default (Boundaries & Constraints: "default 3x WATCHER_POLL_INTERVAL") is derived from
+	// WATCHER_POLL_INTERVAL if this process's own environment happens to have it set (shared
+	// .env files commonly do, even though this is a broadcaster, not a watcher, process),
+	// falling back to defaultWatcherPollInterval otherwise — mirroring runWatcher's own
+	// WATCHER_POLL_INTERVAL parsing exactly, just read here instead of defaulted-and-applied.
+	watcherPollIntervalForDefault := defaultWatcherPollInterval
+	if v := os.Getenv("WATCHER_POLL_INTERVAL"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			watcherPollIntervalForDefault = parsed
+		}
+	}
+	livenessStalenessThreshold := defaultLivenessStalenessMultiplier * watcherPollIntervalForDefault
+	if v := os.Getenv("LIVENESS_STALENESS_THRESHOLD"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("LIVENESS_STALENESS_THRESHOLD must be a valid duration (e.g. \"15s\"), got %q: %w", v, err)
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("LIVENESS_STALENESS_THRESHOLD must be a positive duration, got %q", v)
+		}
+		livenessStalenessThreshold = parsed
+	}
+
 	chain := evm.Chain{Name: *chainName, RPCURL: rpcURL, ChainID: chainID}
 
 	pool, err := pgxpool.New(ctx, dsn)
@@ -607,6 +654,8 @@ func runBroadcaster(logger *slog.Logger, args []string) error {
 	withdrawalRepo := postgres.NewWithdrawalRepository()
 	signAndBroadcast := core.NewSignAndBroadcastWithdrawal(withdrawalRepo, withdrawalSigner, transactionBroadcaster, txBeginner)
 	pollReceipts := core.NewPollWithdrawalReceipts(withdrawalRepo, transactionBroadcaster, txBeginner)
+	detectStuck := core.NewDetectStuckWithdrawals(withdrawalRepo, txBeginner)
+	watcherLiveness := postgres.NewWatcherLiveness(pool)
 
 	coreChain := core.Chain(*chainName)
 
@@ -615,23 +664,58 @@ func runBroadcaster(logger *slog.Logger, args []string) error {
 		"pollInterval", pollInterval.String(),
 		"signerBackend", signerBackend,
 		"signerAddress", signerAddress,
+		"withdrawalStuckThreshold", stuckThreshold.String(),
+		"livenessStalenessThreshold", livenessStalenessThreshold.String(),
 	)
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	// lastLive tracks the previous tick's liveness determination so transitions are logged
+	// at most once, not every tick (Boundaries & Constraints) — nil means "not yet
+	// determined," which forces the very first tick's outcome to be logged too, then only
+	// actual flips from there on.
+	var lastLive *bool
+
 	// Poll once immediately, then on every tick, until SIGINT/SIGTERM — mirrors
-	// runWatcher's identical loop shape. Each tick first drains the approved-withdrawal
-	// backlog (calling SignAndBroadcastWithdrawal.Execute repeatedly until it reports
-	// nothing left to claim, Code Map: "the broadcaster's poll loop calls it once per
-	// approved withdrawal per tick"), then checks every broadcast withdrawal's receipt
-	// once. A single claim/build/sign/broadcast failure is logged and stops the inner
-	// drain loop for this tick (the failed withdrawal is left at WithdrawalStatusSigned,
-	// Story 3.5's territory to resume) — never a fatal process crash.
+	// runWatcher's identical loop shape. Each tick: (1) checks the watcher's own cursor
+	// liveness (Story 3.5, AD-15) — a stale cursor skips claiming/resuming new work THIS
+	// tick entirely (no new nonce allocated, no new withdrawal stranded) but never blocks
+	// the two steps below, which always run regardless; (2) checks every broadcast
+	// withdrawal's receipt once; (3) runs one stuck-detection pass. A single claim/build/
+	// sign/broadcast failure is logged and stops the inner drain loop for this tick (the
+	// failed withdrawal is left at WithdrawalStatusSigned, resumed automatically next tick)
+	// — never a fatal process crash.
 	for {
+		live, err := watcherLiveness.IsLive(ctx, coreChain, livenessStalenessThreshold)
+		if err != nil {
+			// A liveness-check failure (e.g. a transient DB hiccup) is treated as "not live"
+			// for this tick — fail safe: better to pause new claims for one tick on a false
+			// alarm than to keep claiming through an outage we simply couldn't observe.
+			logger.Error("broadcaster liveness check failed; treating watcher as not live this tick", "chain", *chainName, "error", err)
+			live = false
+		}
+		if lastLive == nil || *lastLive != live {
+			if live {
+				logger.Info("watcher cursor liveness recovered — resuming withdrawal claims", "chain", *chainName)
+			} else {
+				logger.Warn("watcher cursor is stale — pausing new withdrawal claims/resends this tick (receipt polling and stuck detection still run)",
+					"chain", *chainName, "stalenessThreshold", livenessStalenessThreshold.String())
+			}
+			liveCopy := live
+			lastLive = &liveCopy
+		}
+
+		// live gates only the fallback to ClaimApprovedWithdrawal inside Execute (allowClaim),
+		// never resuming an already-signed withdrawal (re-review 2026-07-22: the original
+		// version wrapped this entire loop in `if live`, so a stale watcher cursor also
+		// paused resending an already-signed withdrawal's persisted bytes — work that
+		// allocates no new nonce and strands nothing new, the exact risk the liveness gate
+		// exists to prevent). This loop therefore always runs, at minimum checking whether
+		// anything is left to resume, even while live is false.
 		claimedCount := 0
 		for {
-			claimed, err := signAndBroadcast.Execute(ctx, coreChain)
+			claimed, err := signAndBroadcast.Execute(ctx, coreChain, live)
 			if err != nil {
 				logger.Error("broadcaster sign-and-broadcast failed", "chain", *chainName, "error", err)
 				break
@@ -646,12 +730,21 @@ func runBroadcaster(logger *slog.Logger, args []string) error {
 		if err != nil {
 			logger.Error("broadcaster poll-receipts failed", "chain", *chainName, "error", err)
 		}
+
+		stuckResult, err := detectStuck.Execute(ctx, coreChain, stuckThreshold)
+		if err != nil {
+			logger.Error("broadcaster stuck-detection failed", "chain", *chainName, "error", err)
+		}
+
 		logger.Info("broadcaster poll completed",
 			"chain", *chainName,
+			"live", live,
 			"claimed", claimedCount,
 			"receiptsChecked", result.Checked,
 			"confirmed", result.Confirmed,
 			"failed", result.Failed,
+			"stuckCandidatesChecked", stuckResult.Checked,
+			"stuckAlerted", stuckResult.Alerted,
 		)
 
 		select {

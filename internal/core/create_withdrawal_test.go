@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
 )
@@ -41,8 +42,16 @@ func (f *fakeWithdrawalRepository) ClaimApprovedWithdrawal(context.Context, core
 	panic("fakeWithdrawalRepository.ClaimApprovedWithdrawal must not be called by CreateWithdrawal tests")
 }
 
-func (f *fakeWithdrawalRepository) RecordBroadcastTxHash(context.Context, string, string) error {
-	panic("fakeWithdrawalRepository.RecordBroadcastTxHash must not be called by CreateWithdrawal tests")
+func (f *fakeWithdrawalRepository) RecordSignedTx(context.Context, string, string, string) error {
+	panic("fakeWithdrawalRepository.RecordSignedTx must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) MarkBroadcast(context.Context, string) error {
+	panic("fakeWithdrawalRepository.MarkBroadcast must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) ListSignedWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
+	panic("fakeWithdrawalRepository.ListSignedWithdrawals must not be called by CreateWithdrawal tests")
 }
 
 func (f *fakeWithdrawalRepository) ListBroadcastWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
@@ -55,6 +64,14 @@ func (f *fakeWithdrawalRepository) SettleConfirmedWithdrawal(context.Context, st
 
 func (f *fakeWithdrawalRepository) SettleFailedWithdrawal(context.Context, string) error {
 	panic("fakeWithdrawalRepository.SettleFailedWithdrawal must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) ListStuckCandidates(context.Context, core.Chain, time.Duration) ([]core.Withdrawal, error) {
+	panic("fakeWithdrawalRepository.ListStuckCandidates must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) MarkStuckAlerted(context.Context, string) error {
+	panic("fakeWithdrawalRepository.MarkStuckAlerted must not be called by CreateWithdrawal tests")
 }
 
 // fakeFeeEstimator (core.FeeEstimator's test double) is defined once, in

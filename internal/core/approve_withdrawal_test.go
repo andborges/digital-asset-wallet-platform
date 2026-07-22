@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
 )
@@ -33,8 +34,16 @@ func (f *fakeApproveWithdrawalRepository) ClaimApprovedWithdrawal(context.Contex
 	panic("fakeApproveWithdrawalRepository.ClaimApprovedWithdrawal must not be called by ApproveWithdrawal tests")
 }
 
-func (f *fakeApproveWithdrawalRepository) RecordBroadcastTxHash(context.Context, string, string) error {
-	panic("fakeApproveWithdrawalRepository.RecordBroadcastTxHash must not be called by ApproveWithdrawal tests")
+func (f *fakeApproveWithdrawalRepository) RecordSignedTx(context.Context, string, string, string) error {
+	panic("fakeApproveWithdrawalRepository.RecordSignedTx must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) MarkBroadcast(context.Context, string) error {
+	panic("fakeApproveWithdrawalRepository.MarkBroadcast must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) ListSignedWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
+	panic("fakeApproveWithdrawalRepository.ListSignedWithdrawals must not be called by ApproveWithdrawal tests")
 }
 
 func (f *fakeApproveWithdrawalRepository) ListBroadcastWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
@@ -47,6 +56,14 @@ func (f *fakeApproveWithdrawalRepository) SettleConfirmedWithdrawal(context.Cont
 
 func (f *fakeApproveWithdrawalRepository) SettleFailedWithdrawal(context.Context, string) error {
 	panic("fakeApproveWithdrawalRepository.SettleFailedWithdrawal must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) ListStuckCandidates(context.Context, core.Chain, time.Duration) ([]core.Withdrawal, error) {
+	panic("fakeApproveWithdrawalRepository.ListStuckCandidates must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) MarkStuckAlerted(context.Context, string) error {
+	panic("fakeApproveWithdrawalRepository.MarkStuckAlerted must not be called by ApproveWithdrawal tests")
 }
 
 func TestApproveWithdrawal_Execute(t *testing.T) {

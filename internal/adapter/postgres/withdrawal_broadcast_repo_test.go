@@ -1,8 +1,8 @@
-// This file exercises Story 3.4's new WithdrawalRepository methods (ClaimApprovedWithdrawal,
-// RecordBroadcastTxHash, ListBroadcastWithdrawals, SettleConfirmedWithdrawal,
-// SettleFailedWithdrawal) against a real PostgreSQL container — reusing newTestPool and the
-// customer/balance fixtures already established in withdrawal_repo_test.go (same
-// postgres_test package).
+// This file exercises Story 3.4/3.5's WithdrawalRepository methods (ClaimApprovedWithdrawal,
+// RecordSignedTx, MarkBroadcast, ListSignedWithdrawals, ListBroadcastWithdrawals,
+// SettleConfirmedWithdrawal, SettleFailedWithdrawal, ListStuckCandidates, MarkStuckAlerted)
+// against a real PostgreSQL container — reusing newTestPool and the customer/balance
+// fixtures already established in withdrawal_repo_test.go (same postgres_test package).
 package postgres_test
 
 import (
@@ -10,6 +10,7 @@ import (
 	"errors"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -251,7 +252,40 @@ func TestClaimApprovedWithdrawal_SecondCallAllocatesNextNonce(t *testing.T) {
 	}
 }
 
-func TestRecordBroadcastTxHash_TransitionsToBroadcast(t *testing.T) {
+// recordSignedTxAndMarkBroadcast drives a claimed withdrawal through Story 3.5's own
+// RecordSignedTx (own transaction, committed BEFORE any send would happen) then MarkBroadcast
+// (own transaction) — the real two-step replacement for Story 3.4's single
+// RecordBroadcastTxHash call, used by every test below that needs a real 'broadcast' row.
+func recordSignedTxAndMarkBroadcast(t *testing.T, pool *pgxpool.Pool, txBeginner *postgres.TxBeginner, withdrawalRepo *postgres.WithdrawalRepository, withdrawalID, txHash, signedTxHex string) {
+	t.Helper()
+	ctx := context.Background()
+
+	recordCtx, recordTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := withdrawalRepo.RecordSignedTx(recordCtx, withdrawalID, txHash, signedTxHex); err != nil {
+		_ = recordTx.Rollback(ctx)
+		t.Fatalf("record signed tx: %v", err)
+	}
+	if err := recordTx.Commit(ctx); err != nil {
+		t.Fatalf("commit record: %v", err)
+	}
+
+	markCtx, markTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := withdrawalRepo.MarkBroadcast(markCtx, withdrawalID); err != nil {
+		_ = markTx.Rollback(ctx)
+		t.Fatalf("mark broadcast: %v", err)
+	}
+	if err := markTx.Commit(ctx); err != nil {
+		t.Fatalf("commit mark broadcast: %v", err)
+	}
+}
+
+func TestRecordSignedTx_PersistsWithoutTransitioningStatus(t *testing.T) {
 	pool := newTestPool(t)
 	txBeginner := postgres.NewTxBeginner(pool)
 	withdrawalRepo := postgres.NewWithdrawalRepository()
@@ -275,29 +309,45 @@ func TestRecordBroadcastTxHash_TransitionsToBroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx: %v", err)
 	}
-	if err := withdrawalRepo.RecordBroadcastTxHash(recordCtx, withdrawal.ID, "0xdeadbeef"); err != nil {
+	if err := withdrawalRepo.RecordSignedTx(recordCtx, withdrawal.ID, "0xdeadbeef", "aabbcc"); err != nil {
 		_ = recordTx.Rollback(ctx)
-		t.Fatalf("record broadcast tx hash: %v", err)
+		t.Fatalf("record signed tx: %v", err)
 	}
 	if err := recordTx.Commit(ctx); err != nil {
 		t.Fatalf("commit record: %v", err)
 	}
 
-	var dbStatus, dbTxHash string
+	// Story 3.5's core restructuring: RecordSignedTx must NEVER transition withdrawals.status
+	// — it stays 'signed' until a separate MarkBroadcast call runs, and withdrawals.tx_hash
+	// (the denormalized column) stays unset too, since MarkBroadcast is what copies it over.
+	var dbStatus string
+	var dbTxHash *string
 	if err := pool.QueryRow(ctx, `SELECT status, tx_hash FROM withdrawals WHERE id = $1`, withdrawal.ID).Scan(&dbStatus, &dbTxHash); err != nil {
 		t.Fatalf("query withdrawal: %v", err)
 	}
-	if dbStatus != core.WithdrawalStatusBroadcast || dbTxHash != "0xdeadbeef" {
-		t.Fatalf("db (status, tx_hash) = (%q, %q), want (%q, %q)", dbStatus, dbTxHash, core.WithdrawalStatusBroadcast, "0xdeadbeef")
+	if dbStatus != core.WithdrawalStatusSigned {
+		t.Fatalf("status = %q, want %q (RecordSignedTx must not transition status)", dbStatus, core.WithdrawalStatusSigned)
+	}
+	if dbTxHash != nil {
+		t.Fatalf("withdrawals.tx_hash = %v, want nil (only MarkBroadcast sets the denormalized column)", *dbTxHash)
 	}
 
-	_, txHash := broadcastAttemptRow(t, pool, withdrawal.ID)
+	nonce, txHash := broadcastAttemptRow(t, pool, withdrawal.ID)
+	_ = nonce
 	if txHash == nil || *txHash != "0xdeadbeef" {
 		t.Fatalf("broadcast_attempts.tx_hash = %v, want 0xdeadbeef", txHash)
 	}
+
+	var signedTx *string
+	if err := pool.QueryRow(ctx, `SELECT signed_tx FROM broadcast_attempts WHERE withdrawal_id = $1`, withdrawal.ID).Scan(&signedTx); err != nil {
+		t.Fatalf("query broadcast_attempts.signed_tx: %v", err)
+	}
+	if signedTx == nil || *signedTx != "aabbcc" {
+		t.Fatalf("broadcast_attempts.signed_tx = %v, want \"aabbcc\"", signedTx)
+	}
 }
 
-func TestRecordBroadcastTxHash_NotSigned_ReturnsError(t *testing.T) {
+func TestRecordSignedTx_NotSigned_ReturnsError(t *testing.T) {
 	pool := newTestPool(t)
 	txBeginner := postgres.NewTxBeginner(pool)
 	withdrawalRepo := postgres.NewWithdrawalRepository()
@@ -311,14 +361,14 @@ func TestRecordBroadcastTxHash_NotSigned_ReturnsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx: %v", err)
 	}
-	err = withdrawalRepo.RecordBroadcastTxHash(txCtx, withdrawal.ID, "0xdeadbeef")
+	err = withdrawalRepo.RecordSignedTx(txCtx, withdrawal.ID, "0xdeadbeef", "aabbcc")
 	_ = tx.Rollback(ctx)
 	if !errors.Is(err, core.ErrWithdrawalNotSigned) {
 		t.Fatalf("err = %v, want core.ErrWithdrawalNotSigned", err)
 	}
 }
 
-func TestRecordBroadcastTxHash_UnknownID_ReturnsErrWithdrawalNotFound(t *testing.T) {
+func TestRecordSignedTx_UnknownID_ReturnsErrWithdrawalNotFound(t *testing.T) {
 	pool := newTestPool(t)
 	txBeginner := postgres.NewTxBeginner(pool)
 	withdrawalRepo := postgres.NewWithdrawalRepository()
@@ -328,7 +378,76 @@ func TestRecordBroadcastTxHash_UnknownID_ReturnsErrWithdrawalNotFound(t *testing
 	if err != nil {
 		t.Fatalf("begin tx: %v", err)
 	}
-	err = withdrawalRepo.RecordBroadcastTxHash(txCtx, uuid.New().String(), "0xdeadbeef")
+	err = withdrawalRepo.RecordSignedTx(txCtx, uuid.New().String(), "0xdeadbeef", "aabbcc")
+	_ = tx.Rollback(ctx)
+	if !errors.Is(err, core.ErrWithdrawalNotFound) {
+		t.Fatalf("err = %v, want core.ErrWithdrawalNotFound", err)
+	}
+}
+
+func TestMarkBroadcast_TransitionsToBroadcastAndCopiesTxHash(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := createApprovedWithdrawal(t, pool, txBeginner, customerID, "base", "eth", "100")
+
+	ctx := context.Background()
+	claimCtx, claimTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, ok, err := withdrawalRepo.ClaimApprovedWithdrawal(claimCtx, core.ChainBase); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if err := claimTx.Commit(ctx); err != nil {
+		t.Fatalf("commit claim: %v", err)
+	}
+
+	recordSignedTxAndMarkBroadcast(t, pool, txBeginner, withdrawalRepo, withdrawal.ID, "0xdeadbeef", "aabbcc")
+
+	var dbStatus, dbTxHash string
+	if err := pool.QueryRow(ctx, `SELECT status, tx_hash FROM withdrawals WHERE id = $1`, withdrawal.ID).Scan(&dbStatus, &dbTxHash); err != nil {
+		t.Fatalf("query withdrawal: %v", err)
+	}
+	if dbStatus != core.WithdrawalStatusBroadcast || dbTxHash != "0xdeadbeef" {
+		t.Fatalf("db (status, tx_hash) = (%q, %q), want (%q, %q)", dbStatus, dbTxHash, core.WithdrawalStatusBroadcast, "0xdeadbeef")
+	}
+}
+
+func TestMarkBroadcast_NotSigned_ReturnsError(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	// Never claimed — still 'approved', not 'signed'.
+	withdrawal := createApprovedWithdrawal(t, pool, txBeginner, customerID, "base", "eth", "100")
+
+	ctx := context.Background()
+	txCtx, tx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	err = withdrawalRepo.MarkBroadcast(txCtx, withdrawal.ID)
+	_ = tx.Rollback(ctx)
+	if !errors.Is(err, core.ErrWithdrawalNotSigned) {
+		t.Fatalf("err = %v, want core.ErrWithdrawalNotSigned", err)
+	}
+}
+
+func TestMarkBroadcast_UnknownID_ReturnsErrWithdrawalNotFound(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	ctx := context.Background()
+	txCtx, tx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	err = withdrawalRepo.MarkBroadcast(txCtx, uuid.New().String())
 	_ = tx.Rollback(ctx)
 	if !errors.Is(err, core.ErrWithdrawalNotFound) {
 		t.Fatalf("err = %v, want core.ErrWithdrawalNotFound", err)
@@ -337,7 +456,10 @@ func TestRecordBroadcastTxHash_UnknownID_ReturnsErrWithdrawalNotFound(t *testing
 
 // claimAndBroadcast drives a fresh approved withdrawal all the way to 'broadcast' via the
 // real repository methods (never a hand-written fixture INSERT), giving settlement tests a
-// realistic starting row.
+// realistic starting row. Uses Story 3.5's own two-step RecordSignedTx-then-MarkBroadcast
+// path (replacing Story 3.4's single RecordBroadcastTxHash call) with a fixed placeholder
+// signed_tx hex string — its exact bytes are irrelevant to every caller of this helper, none
+// of which exercise the resend path.
 func claimAndBroadcast(t *testing.T, pool *pgxpool.Pool, txBeginner *postgres.TxBeginner, customerID, chain, asset, amount, txHash string) core.Withdrawal {
 	t.Helper()
 	ctx := context.Background()
@@ -357,16 +479,7 @@ func claimAndBroadcast(t *testing.T, pool *pgxpool.Pool, txBeginner *postgres.Tx
 		t.Fatalf("commit claim: %v", err)
 	}
 
-	recordCtx, recordTx, err := txBeginner.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
-	if err := withdrawalRepo.RecordBroadcastTxHash(recordCtx, claimed.ID, txHash); err != nil {
-		t.Fatalf("record broadcast tx hash: %v", err)
-	}
-	if err := recordTx.Commit(ctx); err != nil {
-		t.Fatalf("commit record: %v", err)
-	}
+	recordSignedTxAndMarkBroadcast(t, pool, txBeginner, withdrawalRepo, claimed.ID, txHash, "deadbeef")
 
 	return core.Withdrawal{ID: withdrawal.ID, CustomerID: customerID, Chain: core.Chain(chain), Asset: core.Asset(asset), Amount: mustParseBigInt(t, amount), TxHash: txHash}
 }
@@ -691,5 +804,450 @@ func TestSettleFailedWithdrawal_NoAvailableAccount_FailsLoud(t *testing.T) {
 	}
 	if dbStatus != core.WithdrawalStatusBroadcast {
 		t.Fatalf("status = %q, want %q (unchanged, retried next poll)", dbStatus, core.WithdrawalStatusBroadcast)
+	}
+}
+
+// TestListSignedWithdrawals_ReturnsNonceTxHashAndSignedTx proves ListSignedWithdrawals' own
+// contract (Story 3.5): a withdrawal claimed and RecordSignedTx'd — but NOT yet
+// MarkBroadcast'd — shows up with its nonce/tx_hash/signed_tx all populated onto the
+// returned core.Withdrawal, decoded back from the hex-encoded column.
+func TestListSignedWithdrawals_ReturnsNonceTxHashAndSignedTx(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := createApprovedWithdrawal(t, pool, txBeginner, customerID, "base", "eth", "100")
+
+	ctx := context.Background()
+	claimCtx, claimTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	claimed, ok, err := withdrawalRepo.ClaimApprovedWithdrawal(claimCtx, core.ChainBase)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if err := claimTx.Commit(ctx); err != nil {
+		t.Fatalf("commit claim: %v", err)
+	}
+
+	recordCtx, recordTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := withdrawalRepo.RecordSignedTx(recordCtx, claimed.ID, "0xsignedhash", "aabbccdd"); err != nil {
+		t.Fatalf("record signed tx: %v", err)
+	}
+	if err := recordTx.Commit(ctx); err != nil {
+		t.Fatalf("commit record: %v", err)
+	}
+
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListSignedWithdrawals(listCtx, core.ChainBase)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list signed withdrawals: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("got %d withdrawals, want exactly 1", len(got))
+	}
+	if got[0].ID != withdrawal.ID {
+		t.Fatalf("got withdrawal %s, want %s", got[0].ID, withdrawal.ID)
+	}
+	if got[0].Nonce == nil || *got[0].Nonce != *claimed.Nonce {
+		t.Fatalf("got nonce %v, want %d", got[0].Nonce, *claimed.Nonce)
+	}
+	if got[0].TxHash != "0xsignedhash" {
+		t.Fatalf("got TxHash %q, want %q", got[0].TxHash, "0xsignedhash")
+	}
+	if string(got[0].SignedTx) != "\xaa\xbb\xcc\xdd" {
+		t.Fatalf("got SignedTx %x, want decoded bytes of aabbccdd", got[0].SignedTx)
+	}
+}
+
+// TestListSignedWithdrawals_ClaimedButNeverSigned_ReturnsEmptySignedTx proves the OTHER
+// resume case: a claimed withdrawal with no RecordSignedTx call yet still appears (it IS at
+// WithdrawalStatusSigned), but with an empty SignedTx — SignAndBroadcastWithdrawal.Execute's
+// own signal to run the full build/sign/persist/send pipeline rather than resend.
+func TestListSignedWithdrawals_ClaimedButNeverSigned_ReturnsEmptySignedTx(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	createApprovedWithdrawal(t, pool, txBeginner, customerID, "base", "eth", "100")
+
+	ctx := context.Background()
+	claimCtx, claimTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, ok, err := withdrawalRepo.ClaimApprovedWithdrawal(claimCtx, core.ChainBase); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if err := claimTx.Commit(ctx); err != nil {
+		t.Fatalf("commit claim: %v", err)
+	}
+
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListSignedWithdrawals(listCtx, core.ChainBase)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list signed withdrawals: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("got %d withdrawals, want exactly 1", len(got))
+	}
+	if len(got[0].SignedTx) != 0 {
+		t.Fatalf("SignedTx = %x, want empty (never signed yet)", got[0].SignedTx)
+	}
+}
+
+// TestListSignedWithdrawals_ExcludesBroadcastAndApproved proves the WHERE clause: only
+// WithdrawalStatusSigned rows are returned — never one already advanced to broadcast, nor
+// one still awaiting its first claim.
+func TestListSignedWithdrawals_ExcludesBroadcastAndApproved(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	broadcastWithdrawal := claimAndBroadcast(t, pool, txBeginner, customerID, "base", "eth", "100", "0xbroadcasttxhash")
+	stillApproved := createApprovedWithdrawal(t, pool, txBeginner, customerID, "base", "eth", "200")
+
+	ctx := context.Background()
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListSignedWithdrawals(listCtx, core.ChainBase)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list signed withdrawals: %v", err)
+	}
+
+	for _, w := range got {
+		if w.ID == broadcastWithdrawal.ID {
+			t.Fatal("an already-broadcast withdrawal must not appear in ListSignedWithdrawals")
+		}
+		if w.ID == stillApproved.ID {
+			t.Fatal("a still-approved (never claimed) withdrawal must not appear in ListSignedWithdrawals")
+		}
+	}
+}
+
+// setBroadcastAttemptCreatedAt backdates withdrawalID's own broadcast_attempts.created_at —
+// the column ListStuckCandidates' own WHERE clause compares against a threshold — so tests
+// can simulate "broadcast a while ago" without a real sleep.
+func setBroadcastAttemptCreatedAt(t *testing.T, pool *pgxpool.Pool, withdrawalID string, createdAt time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE broadcast_attempts SET created_at = $1 WHERE withdrawal_id = $2`,
+		createdAt, withdrawalID,
+	); err != nil {
+		t.Fatalf("backdate broadcast_attempts.created_at: %v", err)
+	}
+}
+
+// setWithdrawalUpdatedAt backdates withdrawals.updated_at directly — re-review 2026-07-22:
+// ListStuckCandidates' WithdrawalStatusBroadcast branch now measures staleness from THIS
+// column (the moment MarkBroadcast actually ran), not from broadcast_attempts.created_at
+// (claim time) — see ListStuckCandidates' own doc comment for why. Tests simulating an
+// old-enough broadcast must backdate this column, not the claim-time one.
+func setWithdrawalUpdatedAt(t *testing.T, pool *pgxpool.Pool, withdrawalID string, updatedAt time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE withdrawals SET updated_at = $1 WHERE id = $2`,
+		updatedAt, withdrawalID,
+	); err != nil {
+		t.Fatalf("backdate withdrawals.updated_at: %v", err)
+	}
+}
+
+func TestListStuckCandidates_ReturnsOldEnoughUnalertedBroadcastWithdrawals(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	stuck := claimAndBroadcast(t, pool, txBeginner, customerID, "base", "eth", "100", "0xstucktxhash")
+	setWithdrawalUpdatedAt(t, pool, stuck.ID, time.Now().UTC().Add(-2*time.Hour))
+
+	fresh := claimAndBroadcast(t, pool, txBeginner, customerID, "base", "eth", "200", "0xfreshtxhash")
+	_ = fresh
+
+	ctx := context.Background()
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListStuckCandidates(listCtx, core.ChainBase, 30*time.Minute)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list stuck candidates: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("got %d candidates, want exactly 1 (only the backdated one exceeds the threshold)", len(got))
+	}
+	if got[0].ID != stuck.ID {
+		t.Fatalf("got candidate %s, want %s", got[0].ID, stuck.ID)
+	}
+}
+
+// TestListStuckCandidates_ReturnsOldEnoughUnalertedSignedWithdrawals proves this story's
+// core review finding directly (re-review 2026-07-22: both an adversarial and an edge-case
+// review pass independently caught that the original version only ever watched
+// WithdrawalStatusBroadcast, leaving a withdrawal parked at WithdrawalStatusSigned — exactly
+// the state a persistent resend failure or the liveness gate can leave one in — with zero
+// monitoring coverage). A withdrawal claimed (never broadcast) whose broadcast_attempts.
+// created_at is old enough must be returned as a stuck candidate, with Status reflecting
+// WithdrawalStatusSigned (not Broadcast) and TxHash empty (never got that far).
+func TestListStuckCandidates_ReturnsOldEnoughUnalertedSignedWithdrawals(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := createApprovedWithdrawal(t, pool, txBeginner, customerID, "base", "eth", "100")
+
+	ctx := context.Background()
+	claimCtx, claimTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, _, err := withdrawalRepo.ClaimApprovedWithdrawal(claimCtx, core.ChainBase); err != nil {
+		_ = claimTx.Rollback(ctx)
+		t.Fatalf("claim approved withdrawal: %v", err)
+	}
+	if err := claimTx.Commit(ctx); err != nil {
+		t.Fatalf("commit claim tx: %v", err)
+	}
+	setBroadcastAttemptCreatedAt(t, pool, withdrawal.ID, time.Now().UTC().Add(-2*time.Hour))
+
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListStuckCandidates(listCtx, core.ChainBase, 30*time.Minute)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list stuck candidates: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("got %d candidates, want exactly 1", len(got))
+	}
+	if got[0].ID != withdrawal.ID {
+		t.Fatalf("got candidate %s, want %s", got[0].ID, withdrawal.ID)
+	}
+	if got[0].Status != core.WithdrawalStatusSigned {
+		t.Fatalf("got status %q, want %q", got[0].Status, core.WithdrawalStatusSigned)
+	}
+	if got[0].TxHash != "" {
+		t.Fatalf("got tx_hash %q, want empty — this withdrawal never reached a successful broadcast", got[0].TxHash)
+	}
+}
+
+// TestListStuckCandidates_SignedNotYetOldEnough_Excluded mirrors
+// TestListStuckCandidates_ExcludesNotYetOldEnough below for the WithdrawalStatusSigned
+// branch specifically: a freshly claimed (never broadcast) withdrawal, well within the
+// threshold, must not be returned.
+func TestListStuckCandidates_SignedNotYetOldEnough_Excluded(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := createApprovedWithdrawal(t, pool, txBeginner, customerID, "base", "eth", "100")
+
+	ctx := context.Background()
+	claimCtx, claimTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, _, err := withdrawalRepo.ClaimApprovedWithdrawal(claimCtx, core.ChainBase); err != nil {
+		_ = claimTx.Rollback(ctx)
+		t.Fatalf("claim approved withdrawal: %v", err)
+	}
+	if err := claimTx.Commit(ctx); err != nil {
+		t.Fatalf("commit claim tx: %v", err)
+	}
+
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListStuckCandidates(listCtx, core.ChainBase, 30*time.Minute)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list stuck candidates: %v", err)
+	}
+	for _, w := range got {
+		if w.ID == withdrawal.ID {
+			t.Fatal("a withdrawal claimed moments ago must not be flagged stuck yet")
+		}
+	}
+}
+
+func TestListStuckCandidates_ExcludesAlreadyAlerted(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := claimAndBroadcast(t, pool, txBeginner, customerID, "base", "eth", "100", "0xalertedtxhash")
+	setWithdrawalUpdatedAt(t, pool, withdrawal.ID, time.Now().UTC().Add(-2*time.Hour))
+
+	ctx := context.Background()
+	alertCtx, alertTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := withdrawalRepo.MarkStuckAlerted(alertCtx, withdrawal.ID); err != nil {
+		t.Fatalf("mark stuck alerted: %v", err)
+	}
+	if err := alertTx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListStuckCandidates(listCtx, core.ChainBase, 30*time.Minute)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list stuck candidates: %v", err)
+	}
+	for _, w := range got {
+		if w.ID == withdrawal.ID {
+			t.Fatal("an already-alerted withdrawal must never be returned again — that is what makes the one-time-alert guarantee hold")
+		}
+	}
+}
+
+func TestListStuckCandidates_ExcludesNotYetOldEnough(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := claimAndBroadcast(t, pool, txBeginner, customerID, "base", "eth", "100", "0xnotoldtxhash")
+
+	ctx := context.Background()
+	listCtx, listTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	got, err := withdrawalRepo.ListStuckCandidates(listCtx, core.ChainBase, 30*time.Minute)
+	_ = listTx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("list stuck candidates: %v", err)
+	}
+	for _, w := range got {
+		if w.ID == withdrawal.ID {
+			t.Fatal("a freshly broadcast withdrawal must not be a stuck candidate yet")
+		}
+	}
+}
+
+func TestMarkStuckAlerted_WritesOutboxEventAndSetsColumn(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := claimAndBroadcast(t, pool, txBeginner, customerID, "base", "eth", "100", "0xstuckoutboxtxhash")
+
+	ctx := context.Background()
+	txCtx, tx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := withdrawalRepo.MarkStuckAlerted(txCtx, withdrawal.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("mark stuck alerted: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	var stuckAlertedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT stuck_alerted_at FROM withdrawals WHERE id = $1`, withdrawal.ID).Scan(&stuckAlertedAt); err != nil {
+		t.Fatalf("query withdrawal: %v", err)
+	}
+	if stuckAlertedAt == nil {
+		t.Fatal("stuck_alerted_at = nil, want set")
+	}
+
+	if got := outboxEventCount(t, pool, "withdrawal.stuck", withdrawal.ID); got != 1 {
+		t.Fatalf("withdrawal.stuck outbox events = %d, want exactly 1", got)
+	}
+
+	// Settling AFTER being marked stuck must leave stuck_alerted_at set — a historical fact,
+	// never cleared (I/O & Edge-Case Matrix's own last row).
+	settleCtx, settleTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := withdrawalRepo.SettleConfirmedWithdrawal(settleCtx, withdrawal.ID); err != nil {
+		t.Fatalf("settle confirmed withdrawal: %v", err)
+	}
+	if err := settleTx.Commit(ctx); err != nil {
+		t.Fatalf("commit settle: %v", err)
+	}
+	var stuckAlertedAtAfterSettle *time.Time
+	if err := pool.QueryRow(ctx, `SELECT stuck_alerted_at FROM withdrawals WHERE id = $1`, withdrawal.ID).Scan(&stuckAlertedAtAfterSettle); err != nil {
+		t.Fatalf("query withdrawal: %v", err)
+	}
+	if stuckAlertedAtAfterSettle == nil {
+		t.Fatal("stuck_alerted_at must remain set after the withdrawal later confirms")
+	}
+}
+
+func TestMarkStuckAlerted_SecondCall_FailsLoud(t *testing.T) {
+	pool := newTestPool(t)
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+
+	customerID := createTestCustomerWithBalance(t, pool, txBeginner, "base", "eth", "10000")
+	withdrawal := claimAndBroadcast(t, pool, txBeginner, customerID, "base", "eth", "100", "0xdoublealerttxhash")
+
+	ctx := context.Background()
+	firstCtx, firstTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := withdrawalRepo.MarkStuckAlerted(firstCtx, withdrawal.ID); err != nil {
+		t.Fatalf("first mark stuck alerted: %v", err)
+	}
+	if err := firstTx.Commit(ctx); err != nil {
+		t.Fatalf("commit first: %v", err)
+	}
+
+	secondCtx, secondTx, err := txBeginner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	err = withdrawalRepo.MarkStuckAlerted(secondCtx, withdrawal.ID)
+	_ = secondTx.Rollback(ctx)
+	if err == nil {
+		t.Fatal("err = nil, want a non-nil error — a withdrawal already marked stuck-alerted must never be alerted a second time")
+	}
+
+	// Never a second outbox event, even though the second (failed, rolled back) call
+	// attempted to insert one before its own RowsAffected check failed.
+	if got := outboxEventCount(t, pool, "withdrawal.stuck", withdrawal.ID); got != 1 {
+		t.Fatalf("withdrawal.stuck outbox events = %d, want exactly 1 (the second attempt rolled back)", got)
 	}
 }
