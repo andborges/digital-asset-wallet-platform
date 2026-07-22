@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // ErrMissingApprovalActor is returned when an approve request omits actor (NFR11:
@@ -29,11 +30,17 @@ func NewApproveWithdrawal(repo WithdrawalRepository) *ApproveWithdrawal {
 	return &ApproveWithdrawal{repo: repo}
 }
 
-// Execute rejects an empty actor or reason (NFR11) before ever reaching the repository —
-// mirroring CreateWithdrawal's own validate-then-delegate shape — and otherwise delegates
-// to WithdrawalRepository.ApproveWithdrawal, which locks the row, verifies its status, and
-// performs the transition atomically.
+// Execute rejects an empty or whitespace-only actor or reason (NFR11) before ever reaching
+// the repository — mirroring CreateWithdrawal's own validate-then-delegate shape — and
+// otherwise delegates to WithdrawalRepository.ApproveWithdrawal, which locks the row,
+// verifies its status, and performs the transition atomically. Both values are trimmed
+// before validation AND before being persisted (re-review: a whitespace-only value like
+// " " previously passed the == "" check and was stored verbatim as the audit trail's
+// approved_by/approval_reason, undercutting NFR11's "logged with a meaningful actor"
+// intent) — the trimmed value, not the raw one, is what reaches the repository.
 func (uc *ApproveWithdrawal) Execute(ctx context.Context, id, actor, reason string) (Withdrawal, error) {
+	actor = strings.TrimSpace(actor)
+	reason = strings.TrimSpace(reason)
 	if actor == "" {
 		return Withdrawal{}, ErrMissingApprovalActor
 	}

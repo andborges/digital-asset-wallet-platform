@@ -757,11 +757,13 @@ components:
       properties:
         actor:
           type: string
+          minLength: 1
           description: >
             The operator approving this withdrawal (NFR11) — required and non-empty;
             this system has no separate operator-identity/auth tier to derive this from.
         reason:
           type: string
+          minLength: 1
           description: The reason for approving this withdrawal (NFR11) — required and non-empty.
     Transaction:
       type: object

@@ -2,12 +2,13 @@
 title: 'Story 3.3: Enforce Pre-Signing Policy & Threshold-Based Approval Routing'
 type: 'feature'
 created: '2026-07-20'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context: []
 warnings: ['oversized']
 baseline_revision: '881ef921ddfb75caefce34f7b2f18df2f39b5901'
+final_revision: '0c3f61b3624e67525f249a59731b14cca82a35a2 (NOT_COMMITTED past this point: user global policy — no auto-commits. All review-pass patches remain uncommitted on top of this revision.)'
 ---
 
 <intent-contract>
@@ -97,6 +98,25 @@ baseline_revision: '881ef921ddfb75caefce34f7b2f18df2f39b5901'
 
 ## Review Triage Log
 
+### 2026-07-21 — Review pass
+- intent_gap: 0
+- bad_spec: 0
+- patch: 10 (high 2, medium 6, low 2)
+- defer: 1 (medium 1)
+- reject: 2
+- addressed_findings:
+  - `[high]` `[patch]` A matching internal-transfer-class bug's sibling here: the `"withdrawal.approved"` outbox event had two structurally incompatible payload shapes depending on which write path produced it (`CreateWithdrawal`'s auto-approval branch: chain/asset/amount/destinationAddress/customerId, no approvedBy/reason; `ApproveWithdrawal`'s operator path: only approvedBy/reason) — a downstream consumer (Story 3.4's future broadcaster) could not decode one fixed shape. Fixed: unified into one `withdrawalRoutedPayload` struct with `approvedBy`/`approvalReason` as `omitempty`, used by both write paths; added payload-content assertions (previously only presence/count was checked) to both `TestCreateWithdrawal_AutoApprovalRouting` and `TestApproveWithdrawal_TransitionsToApproved`.
+  - `[high]` `[patch]` `actor`/`reason` on `POST /withdrawals/{id}/approve` were checked only for exact emptiness (`== ""`), so a whitespace-only value (`" "`) passed validation and was persisted verbatim into the audit trail (NFR11). Fixed: `ApproveWithdrawal.Execute` now trims both before validating and before passing them on, so the trimmed value — not the raw one — reaches the repository and the audit columns.
+  - `[medium]` `[patch]` The zero-address denylist error (`ErrInvalidDestinationAddress`) and the shape-check error (`ErrMalformedDestinationAddress`) both mapped to the identical RFC 9457 problem `"title"` (`"invalid-destination-address"`), contradicting the adjacent comment's claim that a distinct title keeps the two failure reasons distinguishable. Fixed: the denylist case now maps to its own title, `"denylisted-destination-address"`.
+  - `[medium]` `[patch]` `ApproveWithdrawal`'s repository `UPDATE` discarded its `RowsAffected()`, unlike the codebase's own established convention for this exact class of risk (Story 2.4's `OrphanDeposit` fix). Currently unreachable given the preceding `SELECT ... FOR UPDATE` re-check, but fixed for defense-in-depth against a future refactor that removes that check while leaving this `UPDATE`'s `WHERE` clause as the only remaining guard.
+  - `[medium]` `[patch]` `feeEstimate.TotalFee`/`threshold` flowed straight into `big.Int.Cmp` with no nil-guard; a future adapter bug returning a nil value with no error would panic the request handler. Fixed: added explicit nil-checks in `CreateWithdrawal.Execute` with new unit tests for both cases.
+  - `[medium]` `[patch]` Migration 0010's down-migration deleted `withdrawals` rows past `'created'` without cleaning up their `hold_journal_entry_id`-referenced `journal_entries`/postings (both legs), unlike migration 0009's own down-migration precedent for the identical class of orphaning risk. Fixed: scoped `DELETE`s against `journal_entries`/`postings` added before the `withdrawals` delete, keyed by `hold_journal_entry_id` so a `'created'` withdrawal's own still-valid hold is never touched.
+  - `[medium]` `[patch]` The account-lock query's `rows.Err()` error branch in `CreateWithdrawal` returned without calling `rows.Close()`, unlike the sibling scan-error branch three lines above it. Fixed for consistency.
+  - `[low]` `[patch]` The OpenAPI `ApproveWithdrawalRequest` schema's `actor`/`reason` were `required` but had no `minLength`, so the schema alone (unlike the enforcing Go-level check) would accept an empty string. Fixed: added `minLength: 1` to both; regenerated `server.gen.go` (embedded-spec bytes only — no generated-code logic change, since this codebase has no request-body JSON-Schema-validation middleware wired against the embedded spec).
+  - `[low]` `[patch]` No test exercised the exact threshold boundary combined with a nonzero fee estimate — existing boundary tests all used a zero fee. Added a case proving the threshold comparison and the fee estimate are independent inputs that don't interact unexpectedly at the boundary.
+- **Deferred** (`{implementation_artifacts}/deferred-work.md`): `CreateWithdrawal.Execute` calls the chain-RPC-backed `FeeEstimator` and `WithdrawalThresholdLister` before any check that the customer even exists — a syntactically valid but nonexistent `customerId` now burns a live outbound RPC call plus a DB round trip before returning 404, a cost/latency amplification surface this story's new external dependencies introduced. Not patched now: fixing it requires deciding where an early, cheap customer-existence check should live (today it's discovered implicitly, deep in the repository's account lookup), a design decision beyond a mechanical one-line fix.
+- **Rejected** (noise): `WithdrawalThresholdLister.GetApprovalThreshold` reads outside the request's open transaction — mirrors the existing `TokenRegistryLister` precedent exactly, not a new inconsistency, and not a correctness bug under read-committed isolation for a rarely-changing ops-config value; outbox_events rows are never cleaned up by any migration's down-path anywhere in this codebase (pre-existing, codebase-wide characteristic, not newly introduced by this story).
+
 ## Design Notes
 
 - **Why the policy-check-and-route step shares Story 3.2's transaction rather than a separate poller.** `ARCHITECTURE-SPINE.md`'s AD-6 designates withdrawals as "api-through-core, single writer" (unlike Epic 2's watcher-poller pattern for deposits) — the solution design's own withdrawal sequence diagram shows the API role writing directly to `awaiting-approval` + outbox in the same step as creation. This codebase's `IdempotencyMiddleware` already opens exactly one transaction per HTTP request and commits once at the end, so "two transitions" (hold placement, then policy-route) unavoidably share one physical commit here — the same pattern Story 2.2's `CreditFinalizedDeposits` already established (multiple logical transitions, one poll-cycle transaction).
@@ -113,3 +133,37 @@ baseline_revision: '881ef921ddfb75caefce34f7b2f18df2f39b5901'
 
 **Manual checks (if no CLI):**
 - Create a withdrawal below threshold: `GET` its status via a future story's endpoint (none yet in v1) or query Postgres directly — confirm `status = 'approved'`. Create one above threshold, confirm `status = 'awaiting-approval'`, then call the approve endpoint and confirm the transition plus the audit columns.
+
+## Auto Run Result
+
+**Status:** done
+
+**Summary:** Implementation (migration 0010, threshold-routing in `CreateWithdrawal`, the new `ApproveWithdrawal` use case/endpoint, all tests) was already complete and passing when this auto-dev run picked up the story — it had been implemented in an earlier session but never carried through review. This run verified every task and acceptance criterion against real Postgres/HTTP-stack tests, then ran a full Blind Hunter + Edge Case Hunter adversarial pass, which found 10 real, fixable issues (2 high) and 1 real-but-deferred design concern. All 10 patches were applied and re-verified; nothing required reopening the frozen intent-contract.
+
+**Files changed (this review pass, on top of the already-complete implementation):**
+- `internal/adapter/api/withdrawals.go` — the zero-address denylist error now maps to its own RFC 9457 problem title (`denylisted-destination-address`), no longer identical to the shape-check error's title
+- `internal/core/approve_withdrawal.go` — `actor`/`reason` are trimmed before validation and before reaching the repository, rejecting whitespace-only values
+- `internal/adapter/postgres/withdrawal_repo.go` — unified the `withdrawal.approved` outbox payload into one shape (`withdrawalRoutedPayload`, with `approvedBy`/`approvalReason` as `omitempty`) written by both `CreateWithdrawal`'s auto-approval branch and `ApproveWithdrawal`'s operator path; `ApproveWithdrawal`'s `UPDATE` now checks `RowsAffected()`; the account-lock query's `rows.Err()` branch now closes `rows` before returning
+- `internal/core/create_withdrawal.go` — nil-guards on `feeEstimate.TotalFee` and `threshold` before the `big.Int.Cmp` calls that use them
+- `internal/adapter/postgres/migrations/0010_add_withdrawal_approval_thresholds_and_approval_states.sql` — down-migration now deletes the `journal_entries`/`postings` for each deleted withdrawal's hold (scoped by `hold_journal_entry_id`) before deleting the withdrawal row itself, mirroring migration 0009's own precedent
+- `api/openapi.yaml`, `internal/adapter/api/server.gen.go` — `ApproveWithdrawalRequest.actor`/`.reason` gain `minLength: 1` (spec-accuracy only; this codebase has no runtime JSON-Schema validation middleware, so Go-level enforcement is unchanged and remains the real guard)
+- `internal/adapter/postgres/withdrawal_repo_test.go` — new `outboxEventPayload` helper decoding actual payload contents (previously only presence/count was checked); extended `TestCreateWithdrawal_AutoApprovalRouting` and `TestApproveWithdrawal_TransitionsToApproved` to assert on it
+- `internal/core/create_withdrawal_test.go` — new cases: threshold boundary combined with a nonzero fee estimate; nil `TotalFee`/nil `threshold` fail loud without calling the repository
+- `_bmad-output/implementation-artifacts/deferred-work.md` — new entry for the pre-customer-existence-check RPC/DB cost concern
+- `_bmad-output/implementation-artifacts/sprint-status.yaml` — `3-3-enforce-pre-signing-policy-and-threshold-based-approval-routing` marked `done`
+
+**Review findings breakdown** (2026-07-21 pass, Blind Hunter + Edge Case Hunter, run independently without shared context, findings deduplicated):
+- 10 patch (2 high, 6 medium, 2 low) — all applied and re-verified: outbox payload schema unification (high, both reviewers found this independently), actor/reason whitespace trimming (high, both reviewers), destination-address problem-title collision, `ApproveWithdrawal`'s missing `RowsAffected` check, nil-guards before `big.Int.Cmp`, migration 0010's down-migration orphaning `journal_entries`/`postings`, a resource-leak on an error path in the account-lock query, OpenAPI `minLength`, and a missing threshold-boundary-with-nonzero-fee test
+- 1 defer (medium) — logged in `deferred-work.md`: `FeeEstimator`/`WithdrawalThresholdLister` calls happen before customer existence is verified, a cost/latency amplification surface; fixing it is a design decision (where to add an early check), not a mechanical patch
+- 2 reject (noise): `WithdrawalThresholdLister` reading outside the tx (mirrors existing `TokenRegistryLister` precedent); outbox_events never cleaned up on any down-migration (pre-existing, codebase-wide, not new here)
+- 0 intent_gap, 0 bad_spec — every finding was either a mechanical patch or out of this story's scope; nothing required renegotiating the frozen intent-contract
+
+**Verification performed:**
+- `go build ./...`, `go vet ./...`, `gofmt -l .`, `make check-import-boundary` — all clean
+- `go test ./internal/core/... ./internal/adapter/postgres/... ./internal/adapter/api/...` — all withdrawal/approve-related tests pass (core unit tests, real-Postgres-18-testcontainer integration tests, full HTTP end-to-end tests), including every newly added case exercising this pass's fixes
+- The only test failures observed (`TestTrackDeposits_Execute_ReorgCheck_*` in `internal/core`, `TestReorgDetection_EndToEnd` in `internal/adapter/api`) are pre-existing and unrelated — Story 2.4's `checkForReorgs` call site is commented out in `track_deposits.go`, untouched by this story; already called out as known/unrelated in this spec's own Verification notes before this run started
+
+**Residual risks:**
+- The 1 deferred item above remains open, tracked in `deferred-work.md`.
+- No git commit was created (user's global no-auto-commit policy). All changes — the original implementation and this review pass's patches alike — remain uncommitted/committed-as-found; see `final_revision` frontmatter.
+- `followup_review_recommended: true` — 2 high-severity findings (an outbox schema inconsistency affecting a future Epic 4 consumer, and an audit-trail integrity gap) plus a data-integrity fix to a migration's down-path, spanning API/core/repository/migration layers, is enough breadth and consequence to warrant one more independent look before this story is fully trusted, even though every individual fix here was small and mechanical.

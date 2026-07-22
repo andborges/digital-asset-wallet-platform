@@ -86,6 +86,14 @@ const (
 	// AccountTypeHold is where a requested withdrawal's amount is reclassified to the
 	// instant it is accepted (Story 3.2) — reserved, but not yet sent on-chain.
 	AccountTypeHold AccountType = "hold"
+	// AccountTypeTreasury is the platform's own hot-wallet holdings for a (chain, asset)
+	// pair (Story 3.4, SOLUTION-DESIGN.md's fixed v1 account taxonomy: "Platform treasury:
+	// the hot wallet's holdings") — customer_id IS NULL, one row per
+	// SupportedChainAssetPairs entry (migration 0011), the same platform-account shape as
+	// AccountTypeAvailable's forwarder-float sibling (migration 0006). A confirmed
+	// withdrawal's hold settles here (debit hold, credit treasury); Story 3.6's sweeps post
+	// INTO this same row, they don't create it (Design Notes).
+	AccountTypeTreasury AccountType = "treasury"
 )
 
 // Account is a per-customer, per-(chain, asset), per-account-type ledger account. It

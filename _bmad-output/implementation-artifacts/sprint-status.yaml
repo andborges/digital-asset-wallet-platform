@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-14
-last_updated: 2026-07-16
+last_updated: 2026-07-21 (bmad-dev-auto: stories 3-3, 3-4 reviewed, patched → done)
 project: digital-asset-wallet-platform
 project_key: NOKEY
 tracking_system: file-system
@@ -67,8 +67,8 @@ development_status:
   epic-3: in-progress
   3-1-query-fee-estimate-before-submitting-a-withdrawal: done
   3-2-request-a-withdrawal-with-idempotent-hold-placement: done
-  3-3-enforce-pre-signing-policy-and-threshold-based-approval-routing: backlog
-  3-4-sign-and-broadcast-withdrawals-via-the-single-writer-broadcaster: backlog
+  3-3-enforce-pre-signing-policy-and-threshold-based-approval-routing: done
+  3-4-sign-and-broadcast-withdrawals-via-the-single-writer-broadcaster: done
   3-5-resolve-stuck-and-failed-withdrawals: backlog
   3-6-sweep-forwarder-balances-to-treasury: backlog
   epic-3-retrospective: optional

@@ -29,6 +29,26 @@ func (f *fakeApproveWithdrawalRepository) ApproveWithdrawal(_ context.Context, i
 	return f.result, f.err
 }
 
+func (f *fakeApproveWithdrawalRepository) ClaimApprovedWithdrawal(context.Context, core.Chain) (core.Withdrawal, bool, error) {
+	panic("fakeApproveWithdrawalRepository.ClaimApprovedWithdrawal must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) RecordBroadcastTxHash(context.Context, string, string) error {
+	panic("fakeApproveWithdrawalRepository.RecordBroadcastTxHash must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) ListBroadcastWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
+	panic("fakeApproveWithdrawalRepository.ListBroadcastWithdrawals must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) SettleConfirmedWithdrawal(context.Context, string) error {
+	panic("fakeApproveWithdrawalRepository.SettleConfirmedWithdrawal must not be called by ApproveWithdrawal tests")
+}
+
+func (f *fakeApproveWithdrawalRepository) SettleFailedWithdrawal(context.Context, string) error {
+	panic("fakeApproveWithdrawalRepository.SettleFailedWithdrawal must not be called by ApproveWithdrawal tests")
+}
+
 func TestApproveWithdrawal_Execute(t *testing.T) {
 	t.Run("rejects an empty actor before calling the repository", func(t *testing.T) {
 		repo := &fakeApproveWithdrawalRepository{}

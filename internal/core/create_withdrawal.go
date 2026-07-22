@@ -73,9 +73,23 @@ func (uc *CreateWithdrawal) Execute(ctx context.Context, req WithdrawalRequest) 
 	if err != nil {
 		return Withdrawal{}, fmt.Errorf("estimate withdrawal fee: %w", err)
 	}
+	// Defensive, not expected validation (re-review 2026-07-21): every real FeeEstimator
+	// implementation always populates TotalFee when err == nil. Guarding it anyway turns a
+	// future adapter bug into a clean error here instead of a big.Int.Cmp(nil) panic
+	// crashing the request handler.
+	if feeEstimate.TotalFee == nil {
+		return Withdrawal{}, fmt.Errorf("fee estimator for %s/%s returned no TotalFee", req.Chain, req.Asset)
+	}
 	threshold, err := uc.thresholds.GetApprovalThreshold(ctx, req.Chain, req.Asset)
 	if err != nil {
 		return Withdrawal{}, fmt.Errorf("get withdrawal approval threshold: %w", err)
+	}
+	// Same defensive reasoning as TotalFee above: WithdrawalThresholdLister's real
+	// implementation never returns a nil threshold with a nil error (it returns an error
+	// on a missing row, "never a guessed default," Design Notes) — guarded here anyway for
+	// the same reason.
+	if threshold == nil {
+		return Withdrawal{}, fmt.Errorf("withdrawal approval threshold lister for %s/%s returned no threshold", req.Chain, req.Asset)
 	}
 
 	targetStatus := WithdrawalStatusAwaitingApproval

@@ -76,8 +76,9 @@ func (s *customerServer) CreateWithdrawal(w http.ResponseWriter, r *http.Request
 	case errors.Is(err, core.ErrInvalidDestinationAddress):
 		// Story 3.3: the zero-address denylist check, distinct from the shape check above
 		// — both are 400s, but a distinct problem "title" keeps the two failure reasons
-		// distinguishable to a caller inspecting the response.
-		WriteProblem(w, http.StatusBadRequest, "invalid-destination-address", err.Error(), r.URL.Path)
+		// distinguishable to a caller inspecting the response (re-review: the title itself
+		// must actually differ, not just this comment's claim that it does).
+		WriteProblem(w, http.StatusBadRequest, "denylisted-destination-address", err.Error(), r.URL.Path)
 		return
 	case errors.Is(err, core.ErrCustomerNotFound):
 		WriteProblem(w, http.StatusNotFound, "customer-not-found", err.Error(), r.URL.Path)

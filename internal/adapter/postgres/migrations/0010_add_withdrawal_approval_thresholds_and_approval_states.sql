@@ -54,6 +54,20 @@ ALTER TABLE withdrawals ADD COLUMN approval_reason text;
 -- down-migration discipline: down-migrations are dev/rollback tooling, not a production
 -- path, so sacrificing an already-advanced withdrawal row here is the right tradeoff,
 -- rather than failing mid-rollback on a CHECK violation).
+--
+-- Delete dependents before the withdrawal rows themselves (re-review 2026-07-21, mirrors
+-- migration 0009's own down-migration discipline for the identical class of risk): each
+-- deleted withdrawal's hold_journal_entry_id (migration 0009, a real FK) points at a
+-- journal_entries row whose postings (BOTH legs — the hold account's and the customer's own
+-- available account's debit leg, same reasoning as migration 0009's down) would otherwise
+-- survive as orphaned rows referencing a withdrawal_id that no longer exists — no FK
+-- violation blocks this (nothing FK-references withdrawals.id from journal_entries/
+-- postings), so the leak is silent data, not a failed rollback, unless cleaned up here.
+-- Scoped by hold_journal_entry_id to exactly the rows about to be deleted, not by
+-- cause_type = 'withdrawal_hold' platform-wide, so a 'created' withdrawal's own still-valid
+-- hold is never touched.
+DELETE FROM postings WHERE journal_entry_id IN (SELECT hold_journal_entry_id FROM withdrawals WHERE status != 'created');
+DELETE FROM journal_entries WHERE id IN (SELECT hold_journal_entry_id FROM withdrawals WHERE status != 'created');
 DELETE FROM withdrawals WHERE status != 'created';
 ALTER TABLE withdrawals DROP COLUMN approval_reason;
 ALTER TABLE withdrawals DROP COLUMN approved_by;

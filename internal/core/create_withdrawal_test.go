@@ -37,6 +37,26 @@ func (f *fakeWithdrawalRepository) ApproveWithdrawal(context.Context, string, st
 	panic("fakeWithdrawalRepository.ApproveWithdrawal must not be called by CreateWithdrawal tests")
 }
 
+func (f *fakeWithdrawalRepository) ClaimApprovedWithdrawal(context.Context, core.Chain) (core.Withdrawal, bool, error) {
+	panic("fakeWithdrawalRepository.ClaimApprovedWithdrawal must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) RecordBroadcastTxHash(context.Context, string, string) error {
+	panic("fakeWithdrawalRepository.RecordBroadcastTxHash must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) ListBroadcastWithdrawals(context.Context, core.Chain) ([]core.Withdrawal, error) {
+	panic("fakeWithdrawalRepository.ListBroadcastWithdrawals must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) SettleConfirmedWithdrawal(context.Context, string) error {
+	panic("fakeWithdrawalRepository.SettleConfirmedWithdrawal must not be called by CreateWithdrawal tests")
+}
+
+func (f *fakeWithdrawalRepository) SettleFailedWithdrawal(context.Context, string) error {
+	panic("fakeWithdrawalRepository.SettleFailedWithdrawal must not be called by CreateWithdrawal tests")
+}
+
 // fakeFeeEstimator (core.FeeEstimator's test double) is defined once, in
 // estimate_fee_test.go, and reused here.
 
@@ -270,6 +290,34 @@ func TestCreateWithdrawal_Execute(t *testing.T) {
 		}
 	})
 
+	t.Run("routes to approved at the exact threshold even with a nonzero fee estimate", func(t *testing.T) {
+		// re-review 2026-07-21: the two existing threshold-boundary tests above both use
+		// defaultFeeEstimator() (fee = 0) — this proves the threshold comparison
+		// (req.Amount.Cmp(threshold)) and the fee estimate are genuinely independent
+		// inputs that don't interact unexpectedly at the boundary: a nonzero fee must
+		// never push an at-threshold amount into awaiting-approval (the fee-inclusive
+		// balance check is a separate, later concern the repository enforces, not part of
+		// this routing decision), and the correct TotalFee must still reach the repository
+		// unchanged.
+		repo := &fakeWithdrawalRepository{}
+		feeEstimator := &fakeFeeEstimator{result: core.FeeEstimate{L2Fee: big.NewInt(3), L1Fee: big.NewInt(4), TotalFee: big.NewInt(7)}}
+		thresholds := &fakeWithdrawalThresholdLister{threshold: big.NewInt(100)}
+		uc := newCreateWithdrawal(repo, feeEstimator, thresholds)
+
+		req := validWithdrawalRequest()
+		req.Amount = big.NewInt(100) // exactly at the threshold
+
+		if _, err := uc.Execute(context.Background(), req); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if repo.gotTargetStatus != core.WithdrawalStatusApproved {
+			t.Fatalf("targetStatus = %q, want %q (amount at threshold, regardless of a nonzero fee)", repo.gotTargetStatus, core.WithdrawalStatusApproved)
+		}
+		if repo.gotFeeEstimate == nil || repo.gotFeeEstimate.Cmp(big.NewInt(7)) != 0 {
+			t.Fatalf("feeEstimate passed to repository = %v, want 7 (TotalFee)", repo.gotFeeEstimate)
+		}
+	})
+
 	t.Run("passes the fee estimator's TotalFee to the repository, not L2Fee or L1Fee alone", func(t *testing.T) {
 		repo := &fakeWithdrawalRepository{}
 		feeEstimator := &fakeFeeEstimator{result: core.FeeEstimate{L2Fee: big.NewInt(10), L1Fee: big.NewInt(20), TotalFee: big.NewInt(30)}}
@@ -295,6 +343,39 @@ func TestCreateWithdrawal_Execute(t *testing.T) {
 		}
 		if repo.called {
 			t.Fatal("repository CreateWithdrawal must not be called when fee estimation fails")
+		}
+	})
+
+	t.Run("fails loud, without calling the repository, if the fee estimator returns a nil TotalFee with no error", func(t *testing.T) {
+		// re-review 2026-07-21: a well-behaved FeeEstimator never does this, but a future
+		// adapter bug returning {TotalFee: nil, err: nil} must produce a clean error here,
+		// not a big.Int.Cmp(nil) panic crashing the request handler.
+		repo := &fakeWithdrawalRepository{}
+		feeEstimator := &fakeFeeEstimator{result: core.FeeEstimate{L2Fee: big.NewInt(0), L1Fee: big.NewInt(0), TotalFee: nil}}
+		uc := newCreateWithdrawal(repo, feeEstimator, defaultThresholdLister())
+
+		_, err := uc.Execute(context.Background(), validWithdrawalRequest())
+
+		if err == nil {
+			t.Fatal("expected an error when the fee estimator returns a nil TotalFee")
+		}
+		if repo.called {
+			t.Fatal("repository CreateWithdrawal must not be called when TotalFee is nil")
+		}
+	})
+
+	t.Run("fails loud, without calling the repository, if the threshold lister returns a nil threshold with no error", func(t *testing.T) {
+		repo := &fakeWithdrawalRepository{}
+		thresholds := &fakeWithdrawalThresholdLister{threshold: nil}
+		uc := newCreateWithdrawal(repo, defaultFeeEstimator(), thresholds)
+
+		_, err := uc.Execute(context.Background(), validWithdrawalRequest())
+
+		if err == nil {
+			t.Fatal("expected an error when the threshold lister returns a nil threshold")
+		}
+		if repo.called {
+			t.Fatal("repository CreateWithdrawal must not be called when threshold is nil")
 		}
 	})
 

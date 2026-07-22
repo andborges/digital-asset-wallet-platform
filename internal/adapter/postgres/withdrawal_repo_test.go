@@ -11,6 +11,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -304,6 +305,43 @@ func outboxEventCount(t *testing.T, pool *pgxpool.Pool, eventType, withdrawalID 
 	return count
 }
 
+// outboxEventPayloadFields is the shape outboxEventPayload decodes a raw jsonb payload
+// into — the fields every withdrawal outbox event this story writes may carry, whichever
+// write path (CreateWithdrawal's routing, or ApproveWithdrawal's operator action) produced
+// it. Fields absent from the raw JSON (omitempty on the write side) decode to Go's zero
+// value ("") here, which is exactly what re-review's payload-shape test below asserts on.
+type outboxEventPayloadFields struct {
+	WithdrawalID       string `json:"withdrawalId"`
+	CustomerID         string `json:"customerId"`
+	Chain              string `json:"chain"`
+	Asset              string `json:"asset"`
+	Amount             string `json:"amount"`
+	DestinationAddress string `json:"destinationAddress"`
+	ApprovedBy         string `json:"approvedBy"`
+	ApprovalReason     string `json:"approvalReason"`
+}
+
+// outboxEventPayload fetches and decodes the single outbox_events row of eventType
+// carrying withdrawalId in its payload (re-review 2026-07-21: outboxEventCount above only
+// ever checked presence/count, never field contents — a schema mismatch or a swapped field
+// would have passed every existing test). Fails the test outright if zero or more than one
+// row matches, since every call site expects exactly one.
+func outboxEventPayload(t *testing.T, pool *pgxpool.Pool, eventType, withdrawalID string) outboxEventPayloadFields {
+	t.Helper()
+	var raw []byte
+	if err := pool.QueryRow(context.Background(),
+		`SELECT payload FROM outbox_events WHERE event_type = $1 AND payload->>'withdrawalId' = $2`,
+		eventType, withdrawalID,
+	).Scan(&raw); err != nil {
+		t.Fatalf("fetch %s outbox payload for withdrawal %s: %v", eventType, withdrawalID, err)
+	}
+	var fields outboxEventPayloadFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("decode %s outbox payload for withdrawal %s: %v (raw: %s)", eventType, withdrawalID, err, raw)
+	}
+	return fields
+}
+
 // TestCreateWithdrawal_AutoApprovalRouting proves that when core (this test's caller,
 // mimicking core.CreateWithdrawal's own decision) passes targetStatus =
 // core.WithdrawalStatusApproved, the repository writes that status and a paired
@@ -356,6 +394,21 @@ func TestCreateWithdrawal_AutoApprovalRouting(t *testing.T) {
 	}
 	if got := outboxEventCount(t, pool, "withdrawal.created", withdrawal.ID); got != 0 {
 		t.Fatalf("withdrawal.created outbox events = %d, want 0 (Story 3.2's event is no longer written)", got)
+	}
+
+	// re-review 2026-07-21: the auto-approval path's "withdrawal.approved" payload must
+	// carry the full withdrawal shape (chain/asset/amount/destinationAddress/customerId) —
+	// the same shape the operator-approval path's payload carries (asserted in
+	// TestApproveWithdrawal_TransitionsToApproved below) — so a consumer of
+	// "withdrawal.approved" can decode one fixed shape regardless of which path produced
+	// it. approvedBy/approvalReason must be absent (omitempty): there is no operator action
+	// on this path.
+	payload := outboxEventPayload(t, pool, "withdrawal.approved", withdrawal.ID)
+	if payload.CustomerID != customerID || payload.Chain != "base" || payload.Asset != "eth" || payload.Amount != "100" || payload.DestinationAddress != "0x00000000000000000000000000000000000000AA" {
+		t.Fatalf("withdrawal.approved payload = %+v, want customerId=%q chain=base asset=eth amount=100 destinationAddress=0x...AA", payload, customerID)
+	}
+	if payload.ApprovedBy != "" || payload.ApprovalReason != "" {
+		t.Fatalf("withdrawal.approved payload approvedBy/approvalReason = %q/%q, want both empty (auto-approval has no operator action)", payload.ApprovedBy, payload.ApprovalReason)
 	}
 }
 
@@ -541,6 +594,19 @@ func TestApproveWithdrawal_TransitionsToApproved(t *testing.T) {
 
 	if got := outboxEventCount(t, pool, "withdrawal.approved", withdrawalID); got != 1 {
 		t.Fatalf("withdrawal.approved outbox events = %d, want exactly 1", got)
+	}
+
+	// re-review 2026-07-21: the operator-approval path's "withdrawal.approved" payload
+	// must carry the SAME fixed shape as the auto-approval path's (asserted in
+	// TestCreateWithdrawal_AutoApprovalRouting above) — customerId/chain/asset/amount/
+	// destinationAddress — plus this path's own approvedBy/approvalReason, not a narrower
+	// payload with only approvedBy/approvalReason (the pre-fix schema-drift bug).
+	payload := outboxEventPayload(t, pool, "withdrawal.approved", withdrawalID)
+	if payload.CustomerID != customerID || payload.Chain != "base" || payload.Asset != "eth" {
+		t.Fatalf("withdrawal.approved payload = %+v, want customerId=%q chain=base asset=eth", payload, customerID)
+	}
+	if payload.ApprovedBy != "ops-alice" || payload.ApprovalReason != "manually reviewed, looks fine" {
+		t.Fatalf("withdrawal.approved payload approvedBy/approvalReason = %q/%q, want %q/%q", payload.ApprovedBy, payload.ApprovalReason, "ops-alice", "manually reviewed, looks fine")
 	}
 }
 

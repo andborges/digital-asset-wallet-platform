@@ -1,7 +1,7 @@
 // Command walletd is the platform's single binary. It dispatches to a role
-// subcommand — "api" and "watcher" exist as of Story 2.1; broadcaster/recon/dispatcher
-// are added by later epics. No CLI framework for this handful of subcommands (see Dev
-// Notes).
+// subcommand — "api" and "watcher" exist as of Story 2.1; "broadcaster" is added by Story
+// 3.4; recon/dispatcher are added by later epics. No CLI framework for this handful of
+// subcommands (see Dev Notes).
 package main
 
 import (
@@ -23,6 +23,8 @@ import (
 	adapterapi "github.com/andborges/digital-asset-wallet-platform/internal/adapter/api"
 	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/evm"
 	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/postgres"
+	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/signer/kms"
+	"github.com/andborges/digital-asset-wallet-platform/internal/adapter/signer/software"
 	"github.com/andborges/digital-asset-wallet-platform/internal/core"
 )
 
@@ -44,11 +46,14 @@ const (
 	// defaultWatcherPollInterval is how often the watcher subcommand runs one
 	// TrackDeposits.Execute poll cycle when WATCHER_POLL_INTERVAL is unset.
 	defaultWatcherPollInterval = 5 * time.Second
+	// defaultBroadcasterPollInterval is how often the broadcaster subcommand runs one
+	// claim-and-advance-then-poll-receipts cycle when BROADCASTER_POLL_INTERVAL is unset.
+	defaultBroadcasterPollInterval = 5 * time.Second
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: walletd <api|watcher>")
+		fmt.Fprintln(os.Stderr, "usage: walletd <api|watcher|broadcaster>")
 		os.Exit(1)
 	}
 
@@ -65,8 +70,13 @@ func main() {
 			logger.Error("walletd watcher exited with error", "error", err)
 			os.Exit(1)
 		}
+	case "broadcaster":
+		if err := runBroadcaster(logger, os.Args[2:]); err != nil {
+			logger.Error("walletd broadcaster exited with error", "error", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown subcommand %q; usage: walletd <api|watcher>\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown subcommand %q; usage: walletd <api|watcher|broadcaster>\n", os.Args[1])
 		os.Exit(1)
 	}
 }
@@ -450,6 +460,224 @@ func runWatcher(logger *slog.Logger, args []string) error {
 			return nil
 		case <-ticker.C:
 		}
+	}
+}
+
+// runBroadcaster runs the broadcaster role for exactly one configured chain (Story 3.4,
+// AD-11: one broadcaster process per chain, mirroring runWatcher's AD-2 discipline exactly)
+// — chain is selected by the required --chain=base|arbitrum flag, which also selects which
+// {CHAIN}_* environment variables this process reads. Mirrors runWatcher's own flag/lock/
+// migrate/poll-loop shape exactly, per the story's own explicit instruction.
+func runBroadcaster(logger *slog.Logger, args []string) error {
+	fs := flag.NewFlagSet("broadcaster", flag.ContinueOnError)
+	chainName := fs.String("chain", "", "chain to broadcast withdrawals for: base|arbitrum")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parse broadcaster flags: %w", err)
+	}
+
+	var envPrefix string
+	switch *chainName {
+	case "base":
+		envPrefix = "BASE"
+	case "arbitrum":
+		envPrefix = "ARBITRUM"
+	default:
+		return fmt.Errorf("--chain must be %q or %q, got %q", "base", "arbitrum", *chainName)
+	}
+
+	// The root context is cancelled on SIGINT/SIGTERM, which stops the poll loop below.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return fmt.Errorf("DATABASE_URL is required")
+	}
+	rpcURL, err := requiredStringEnv(envPrefix + "_RPC_URL")
+	if err != nil {
+		return err
+	}
+	chainID, err := requiredChainIDEnv(envPrefix + "_CHAIN_ID")
+	if err != nil {
+		return err
+	}
+
+	pollInterval := defaultBroadcasterPollInterval
+	if v := os.Getenv("BROADCASTER_POLL_INTERVAL"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("BROADCASTER_POLL_INTERVAL must be a valid duration (e.g. \"5s\"), got %q: %w", v, err)
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("BROADCASTER_POLL_INTERVAL must be a positive duration, got %q", v)
+		}
+		pollInterval = parsed
+	}
+
+	chain := evm.Chain{Name: *chainName, RPCURL: rpcURL, ChainID: chainID}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	defer pool.Close()
+
+	// AD-11 says exactly one broadcaster OS process runs per chain — enforced the same way
+	// runWatcher enforces AD-2's identical rule (watcherLockID's own doc comment): a
+	// session-held Postgres advisory lock, scoped to this chain, keyed in a NUMERIC
+	// NAMESPACE DISTINCT from watcherLockID's (890_200_00x here vs. 890_100_00x there,
+	// broadcasterLockID's own doc comment) so the two locks for the same chain never
+	// collide — the watcher and the broadcaster are independent roles that must be able to
+	// run concurrently against the same chain. The dedicated connection is held for this
+	// process's entire lifetime and released only at shutdown, right before pool.Close()
+	// above runs.
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire postgres connection for broadcaster lock: %w", err)
+	}
+	defer lockConn.Release()
+
+	var lockAcquired bool
+	if err := lockConn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", broadcasterLockID(*chainName)).Scan(&lockAcquired); err != nil {
+		return fmt.Errorf("acquire broadcaster advisory lock for chain %q: %w", *chainName, err)
+	}
+	if !lockAcquired {
+		return fmt.Errorf("another broadcaster process already holds the advisory lock for chain %q (AD-11: exactly one broadcaster process per chain)", *chainName)
+	}
+
+	if err := postgres.Migrate(ctx, pool); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
+	}
+
+	tokenRegistry := postgres.NewTokenRegistry(pool)
+
+	transactionBroadcaster, err := evm.NewBroadcaster(ctx, chain, tokenRegistry)
+	if err != nil {
+		return fmt.Errorf("connect transaction broadcaster: %w", err)
+	}
+	defer transactionBroadcaster.Close()
+
+	// Composition root: wires SIGNER_BACKEND=kms|software to pick the Signer
+	// implementation (Code Map) — the only place that decides which one this process runs
+	// with. NFR13: neither branch below ever logs anything derived from key material,
+	// only (at most, via each Signer's own Address() method) a public Ethereum address.
+	// SIGNER_BACKEND has no default (re-review 2026-07-21): the software signer's own
+	// package doc says plainly "dev/test only," so silently defaulting to it here — as an
+	// earlier version of this function did — means an operator who simply forgets to set
+	// SIGNER_BACKEND=kms in production gets no error at all, only a real hot-wallet key
+	// signed by a plaintext in-memory key instead of AWS KMS. Every other required
+	// configuration value in this function (DATABASE_URL, RPC URLs, SIGNER_PRIVATE_KEY,
+	// SIGNER_KMS_KEY_ID) already fails loud via requiredStringEnv when missing; this is the
+	// one that most needs to, since it decides the custody backend.
+	signerBackend, err := requiredStringEnv("SIGNER_BACKEND")
+	if err != nil {
+		return err
+	}
+	var withdrawalSigner core.Signer
+	var signerAddress string
+	switch signerBackend {
+	case "software":
+		privateKeyHex, err := requiredStringEnv("SIGNER_PRIVATE_KEY")
+		if err != nil {
+			return err
+		}
+		softwareSigner, err := software.NewSigner(privateKeyHex)
+		if err != nil {
+			return fmt.Errorf("construct software signer: %w", err)
+		}
+		withdrawalSigner, signerAddress = softwareSigner, softwareSigner.Address()
+	case "kms":
+		kmsKeyID, err := requiredStringEnv("SIGNER_KMS_KEY_ID")
+		if err != nil {
+			return err
+		}
+		kmsSigner, err := kms.NewSigner(ctx, kmsKeyID)
+		if err != nil {
+			return fmt.Errorf("construct KMS signer: %w", err)
+		}
+		withdrawalSigner, signerAddress = kmsSigner, kmsSigner.Address()
+	default:
+		return fmt.Errorf("SIGNER_BACKEND must be %q or %q, got %q", "software", "kms", signerBackend)
+	}
+
+	// Composition root, same as runAPI/runWatcher: the only place that imports
+	// internal/adapter/evm, internal/adapter/signer/{software,kms}, and
+	// internal/adapter/postgres together for the broadcaster role.
+	txBeginner := postgres.NewTxBeginner(pool)
+	withdrawalRepo := postgres.NewWithdrawalRepository()
+	signAndBroadcast := core.NewSignAndBroadcastWithdrawal(withdrawalRepo, withdrawalSigner, transactionBroadcaster, txBeginner)
+	pollReceipts := core.NewPollWithdrawalReceipts(withdrawalRepo, transactionBroadcaster, txBeginner)
+
+	coreChain := core.Chain(*chainName)
+
+	logger.Info("walletd broadcaster starting",
+		"chain", *chainName,
+		"pollInterval", pollInterval.String(),
+		"signerBackend", signerBackend,
+		"signerAddress", signerAddress,
+	)
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	// Poll once immediately, then on every tick, until SIGINT/SIGTERM — mirrors
+	// runWatcher's identical loop shape. Each tick first drains the approved-withdrawal
+	// backlog (calling SignAndBroadcastWithdrawal.Execute repeatedly until it reports
+	// nothing left to claim, Code Map: "the broadcaster's poll loop calls it once per
+	// approved withdrawal per tick"), then checks every broadcast withdrawal's receipt
+	// once. A single claim/build/sign/broadcast failure is logged and stops the inner
+	// drain loop for this tick (the failed withdrawal is left at WithdrawalStatusSigned,
+	// Story 3.5's territory to resume) — never a fatal process crash.
+	for {
+		claimedCount := 0
+		for {
+			claimed, err := signAndBroadcast.Execute(ctx, coreChain)
+			if err != nil {
+				logger.Error("broadcaster sign-and-broadcast failed", "chain", *chainName, "error", err)
+				break
+			}
+			if !claimed {
+				break
+			}
+			claimedCount++
+		}
+
+		result, err := pollReceipts.Execute(ctx, coreChain)
+		if err != nil {
+			logger.Error("broadcaster poll-receipts failed", "chain", *chainName, "error", err)
+		}
+		logger.Info("broadcaster poll completed",
+			"chain", *chainName,
+			"claimed", claimedCount,
+			"receiptsChecked", result.Checked,
+			"confirmed", result.Confirmed,
+			"failed", result.Failed,
+		)
+
+		select {
+		case <-ctx.Done():
+			logger.Info("shutdown signal received, walletd broadcaster stopping")
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// broadcasterLockID returns the fixed Postgres advisory-lock key for chainName's
+// broadcaster — a distinct numeric namespace (890_200_00x) from watcherLockID's
+// (890_100_00x) so the two locks for the same chain never collide: the watcher and the
+// broadcaster are independent roles (AD-2 vs. AD-11) that must both be able to hold their
+// own lock for the same chain at the same time.
+func broadcasterLockID(chainName string) int64 {
+	switch chainName {
+	case "base":
+		return 890_200_001
+	case "arbitrum":
+		return 890_200_002
+	default:
+		// Unreachable: runBroadcaster already validated chainName is "base" or "arbitrum"
+		// before this is ever called.
+		panic(fmt.Sprintf("broadcasterLockID: unknown chain %q", chainName))
 	}
 }
 

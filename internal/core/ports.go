@@ -278,6 +278,97 @@ type WithdrawalRepository interface {
 	// concurrent double-approve race, made deterministic by the row lock — or still
 	// created).
 	ApproveWithdrawal(ctx context.Context, id, actor, reason string) (Withdrawal, error)
+	// ClaimApprovedWithdrawal locks and claims exactly one approved withdrawal on chain for
+	// broadcasting (Story 3.4): it selects one withdrawal at WithdrawalStatusApproved
+	// (FOR UPDATE SKIP LOCKED — a defensive concurrency guard, not load-bearing, since
+	// AD-11 pins exactly one broadcaster process per chain), allocates the next nonce from
+	// chain_nonce_state, inserts a broadcast_attempts row (nonce, no tx_hash yet), and
+	// transitions the withdrawal to WithdrawalStatusSigned — ALL in the SAME transaction,
+	// which the caller commits BEFORE any Signer/TransactionBroadcaster call happens
+	// (AD-11's exact wording: the nonce allocation and the broadcast_attempts row insert
+	// commit in the same transaction that records the broadcast attempt, before the
+	// sign/broadcast calls happen). ok is false, with no error, when no approved
+	// withdrawal exists to claim on chain — an ordinary "nothing to do this poll" outcome,
+	// never an error. The returned Withdrawal's Nonce is always populated when ok is true.
+	ClaimApprovedWithdrawal(ctx context.Context, chain Chain) (w Withdrawal, ok bool, err error)
+	// RecordBroadcastTxHash records txHash on both broadcast_attempts and withdrawals (the
+	// latter a denormalized read-convenience column, Design Notes) and transitions the
+	// withdrawal to WithdrawalStatusBroadcast — called only after
+	// TransactionBroadcaster.SendRawTransaction has already succeeded. Returns
+	// ErrWithdrawalNotFound if no such withdrawal exists, or ErrWithdrawalNotSigned if it
+	// exists but is not currently at WithdrawalStatusSigned (defensive, see that error's
+	// own doc comment).
+	RecordBroadcastTxHash(ctx context.Context, withdrawalID, txHash string) error
+	// ListBroadcastWithdrawals returns every withdrawal on chain currently at
+	// WithdrawalStatusBroadcast with a known tx_hash — PollWithdrawalReceipts' own input set
+	// each poll cycle.
+	ListBroadcastWithdrawals(ctx context.Context, chain Chain) ([]Withdrawal, error)
+	// SettleConfirmedWithdrawal locks the withdrawal row FOR UPDATE, verifies its status is
+	// WithdrawalStatusBroadcast, transitions it to WithdrawalStatusConfirmed, and writes one
+	// balanced journal entry (debit the customer's hold account, credit the platform's
+	// treasury account for the same (chain, asset), Design Notes: postings must net to
+	// zero, extinguishing the hold Story 3.2 originally credited) plus a paired
+	// "withdrawal.confirmed" outbox event — atomically. Returns ErrWithdrawalNotBroadcast
+	// if the withdrawal is not currently WithdrawalStatusBroadcast (defensive), or a
+	// registry-gap error (fail loud, mirroring Story 3.3's identical "registry gap"
+	// principle) if no treasury platform account row exists for the withdrawal's (chain,
+	// asset) — the withdrawal then stays at WithdrawalStatusBroadcast for the next poll to
+	// retry (I/O & Edge-Case Matrix).
+	SettleConfirmedWithdrawal(ctx context.Context, withdrawalID string) error
+	// SettleFailedWithdrawal mirrors SettleConfirmedWithdrawal for an on-chain-reverted
+	// withdrawal: transitions to WithdrawalStatusFailed and writes one balanced journal
+	// entry (debit hold, credit the customer's own available account — releasing the hold
+	// back to available, Design Notes) plus a paired "withdrawal.failed" outbox event.
+	SettleFailedWithdrawal(ctx context.Context, withdrawalID string) error
+}
+
+// Signer signs a 32-byte digest and returns a standard 65-byte Ethereum signature
+// (r[32] || s[32] || v[1]) — chain-library-agnostic (AD-1): no go-ethereum type, and no key
+// handle or private key material, ever crosses this port in either direction (NFR13: the
+// return type is a signature only). chain is accepted for interface symmetry with the rest
+// of this codebase's chain-scoped ports, but AD-10 pins exactly one hot-wallet address
+// SYSTEM-WIDE (valid on both configured chains), so every real implementation ignores it
+// for key selection. Implemented in internal/adapter/signer/software (an in-memory ECDSA
+// key, dev/test only) and internal/adapter/signer/kms (AWS KMS, the prod backend, also
+// usable against LocalStack KMS via the same code path, AD-10).
+// SignAndBroadcastWithdrawal (core) is this port's only caller.
+type Signer interface {
+	Sign(ctx context.Context, chain Chain, digest [32]byte) (signature [65]byte, err error)
+}
+
+// TransactionBroadcaster builds, assembles, and sends a withdrawal's on-chain transaction,
+// and checks its receipt against chain's finalized tag — all go-ethereum-shaped data
+// crossing this port as opaque []byte/[32]byte/[65]byte/string, never a go-ethereum type
+// (AD-1: all go-ethereum/raw-transaction/RLP code stays confined to internal/adapter/evm).
+// Implemented in internal/adapter/evm. Core (SignAndBroadcastWithdrawal,
+// PollWithdrawalReceipts) orchestrates between this port and Signer — the EVM adapter never
+// calls the Signer adapter directly (adapters-don't-call-adapters); only core sits between
+// them.
+type TransactionBroadcaster interface {
+	// BuildUnsignedWithdrawal constructs chain's unsigned EIP-1559 withdrawal transaction —
+	// a plain value transfer of amount to "to" for asset == AssetETH, or an ABI-encoded
+	// ERC-20 transfer(to, amount) call against chain's registered contract for
+	// asset == AssetUSDC (the asset-specific encoding is entirely this adapter's concern,
+	// core never sees it) — using nonce as already allocated by
+	// WithdrawalRepository.ClaimApprovedWithdrawal, and returns its EIP-1559 signing digest
+	// (the value Signer.Sign must sign) alongside the still-unsigned transaction's opaque
+	// encoded bytes, which AssembleSignedTx needs later.
+	BuildUnsignedWithdrawal(ctx context.Context, chain Chain, asset Asset, nonce int64, to string, amount *big.Int) (digest [32]byte, unsignedTx []byte, err error)
+	// AssembleSignedTx combines unsignedTx with signature (Signer's own output) into a
+	// broadcastable signed transaction, returning its encoded bytes and its hash. Pure and
+	// deterministic given its inputs — no chain I/O, so it takes no context or chain
+	// parameter.
+	AssembleSignedTx(unsignedTx []byte, signature [65]byte) (signedTx []byte, txHash string, err error)
+	// SendRawTransaction broadcasts signedTx via eth_sendRawTransaction.
+	SendRawTransaction(ctx context.Context, chain Chain, signedTx []byte) error
+	// GetFinalizedReceipt checks whether txHash has a receipt at or below chain's current
+	// "finalized" tag (mirrors evm.Scanner.Head's own tag-query pattern, AD-7's identical
+	// tag choice for deposit crediting). found is false — with no error — both when no
+	// receipt exists yet AND when a receipt exists but its block hasn't reached
+	// "finalized" yet: both mean "keep polling," never an error. success (only meaningful
+	// when found is true) reflects the receipt's own on-chain status: true for a
+	// successful transaction, false for a reverted one.
+	GetFinalizedReceipt(ctx context.Context, chain Chain, txHash string) (found, success bool, err error)
 }
 
 // WithdrawalThresholdLister reads a (chain, asset) pair's configured withdrawal approval

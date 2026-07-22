@@ -26,6 +26,33 @@ const WithdrawalStatusAwaitingApproval = "awaiting-approval"
 // via an operator's explicit approval of a WithdrawalStatusAwaitingApproval withdrawal.
 const WithdrawalStatusApproved = "approved"
 
+// WithdrawalStatusSigned is a withdrawal whose nonce has been durably allocated from
+// chain_nonce_state and whose broadcast_attempts row has been committed (Story 3.4, AD-11's
+// exact wording: the nonce allocation and that row's insert commit BEFORE any sign/
+// broadcast call happens) — but which has not yet been successfully signed AND broadcast.
+// A withdrawal can sit here indefinitely if the signer or the broadcast call failed (I/O &
+// Edge-Case Matrix: "...leaves that withdrawal at signed with no tx_hash"); resuming it is
+// explicitly Story 3.5's job, never this one's (Boundaries & Constraints).
+const WithdrawalStatusSigned = "signed"
+
+// WithdrawalStatusBroadcast is a withdrawal whose signed transaction has been successfully
+// sent to the chain (eth_sendRawTransaction accepted it) — tx_hash is now known, and the
+// broadcaster's poll-receipts phase checks it against the chain's finalized tag every poll
+// cycle until it settles to confirmed or failed.
+const WithdrawalStatusBroadcast = "broadcast"
+
+// WithdrawalStatusConfirmed is a withdrawal whose broadcast transaction has a successful
+// receipt at the chain's finalized tag (Story 3.4, mirroring AD-7's identical tag choice
+// for deposit crediting) — terminal: its hold has been settled (debit hold, credit
+// treasury).
+const WithdrawalStatusConfirmed = "confirmed"
+
+// WithdrawalStatusFailed is a withdrawal whose broadcast transaction reverted on-chain
+// (confirmed at the finalized tag, but with a failed receipt status) — terminal: its hold
+// has been released back to the customer's available balance (debit hold, credit
+// available).
+const WithdrawalStatusFailed = "failed"
+
 // ErrMalformedDestinationAddress is returned when a withdrawal request's destination
 // address is not a structurally well-formed 20-byte hex address
 // (^0x[0-9a-fA-F]{40}$, matching unsupported_token_observations.address's existing CHECK
@@ -64,6 +91,20 @@ var ErrWithdrawalNotFound = errors.New("withdrawal not found")
 // winning request's commit and is served by IdempotencyMiddleware's own dedup.
 var ErrDuplicateWithdrawalCause = errors.New("a journal entry already exists for this idempotency key")
 
+// ErrWithdrawalNotSigned is returned by WithdrawalRepository.RecordBroadcastTxHash when the
+// withdrawal being recorded is not currently at WithdrawalStatusSigned — defensive, should
+// be unreachable: SignAndBroadcastWithdrawal only ever calls this immediately after its own
+// ClaimApprovedWithdrawal call transitioned the same row to WithdrawalStatusSigned, in the
+// same broadcaster process, with no other writer of withdrawals.status ever running
+// concurrently against the same row (AD-11: exactly one broadcaster process per chain).
+var ErrWithdrawalNotSigned = errors.New("withdrawal is not signed")
+
+// ErrWithdrawalNotBroadcast is returned by WithdrawalRepository.SettleConfirmedWithdrawal
+// and SettleFailedWithdrawal when the withdrawal being settled is not currently at
+// WithdrawalStatusBroadcast — defensive, should be unreachable: PollWithdrawalReceipts only
+// ever calls these for withdrawals its own ListBroadcastWithdrawals call just returned.
+var ErrWithdrawalNotBroadcast = errors.New("withdrawal is not broadcast")
+
 // WithdrawalRequest is the input to CreateWithdrawal (Story 3.2).
 type WithdrawalRequest struct {
 	CustomerID         string
@@ -96,4 +137,14 @@ type Withdrawal struct {
 	ApprovedAt         *time.Time
 	ApprovedBy         string
 	ApprovalReason     string
+	// TxHash is this withdrawal's broadcast transaction hash (Story 3.4) — "" until
+	// WithdrawalRepository.RecordBroadcastTxHash has run. A denormalized read-convenience
+	// copy of broadcast_attempts.tx_hash (Design Notes); broadcast_attempts remains the
+	// source of truth.
+	TxHash string
+	// Nonce is the per-chain nonce WithdrawalRepository.ClaimApprovedWithdrawal allocated
+	// for this withdrawal from chain_nonce_state (Story 3.4, AD-10: nonce state is per-chain
+	// only, never per-address) — nil until claimed (still WithdrawalStatusApproved or
+	// earlier), populated from WithdrawalStatusSigned onward.
+	Nonce *int64
 }
